@@ -167,8 +167,12 @@ class XE3Net(nn.Module):
         """
         # get required input from data
         at_no = data.at_no; pos=data.pos; edge_index=data.edge_index; batch=data.batch
+        if hasattr(data, "shifts"):
+            shifts = data.shifts
+        else:
+            shifts = torch.zeros((edge_index.shape[1], 3), device=pos.device)
         # embed input
-        x_embed, rbf, fcut, rsh = self.embed(at_no, pos, edge_index)
+        x_embed, rbf, fcut, rsh = self.embed(at_no, pos, edge_index, shifts)
         edge_attr = rbf * fcut 
         node_feat = x_embed
         # message passing and node update

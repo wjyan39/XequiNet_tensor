@@ -41,9 +41,14 @@ class XE3embedding(nn.Module):
         self.edge_irreps = o3.Irreps(edge_irreps)
         self.edge_num_irreps = self.edge_irreps.num_irreps
         # self.embedding = nn.Embedding(100, self.node_dim)
-        self.int2c1e = Int2c1eEmbedding(embed_basis, aux_basis)
-        self.node_lin = nn.Linear(self.int2c1e.embed_dim, self.node_dim)
-        nn.init.zeros_(self.node_lin.bias)
+        if embed_basis == "one-hot":
+            self.node_embed = nn.Embedding(120, self.node_dim, padding_idx=0)
+            self.one_hot = True
+        else:
+            self.int2c1e = Int2c1eEmbedding(embed_basis, aux_basis)
+            self.node_lin = nn.Linear(self.int2c1e.embed_dim, self.node_dim)
+            nn.init.zeros_(self.node_lin.bias)
+            self.one_hot = False 
         max_l = self.edge_irreps.lmax
         self.irreps_rshs = o3.Irreps.spherical_harmonics(max_l)
         self.sph_harm = o3.SphericalHarmonics(self.irreps_rshs, normalize=True, normalization="component")
@@ -55,6 +60,7 @@ class XE3embedding(nn.Module):
         at_no: torch.LongTensor,
         pos: torch.Tensor,
         edge_index: torch.Tensor,
+        shifts: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -68,18 +74,19 @@ class XE3embedding(nn.Module):
             `rsh`: Real spherical harmonics.
         """
         # calculate distance and relative position
-        pos = pos[:, [1, 2, 0]]  # [x, y, z] -> [y, z, x]
-        vec = pos[edge_index[0]] - pos[edge_index[1]]
+        vec = pos[edge_index[0]] - pos[edge_index[1]] - shifts
         dist = torch.linalg.vector_norm(vec, dim=-1, keepdim=True)
-        # node linear
-        # x_scalar = self.embedding(at_no)
-        x = self.int2c1e(at_no)
-        x_scalar = self.node_lin(x)
+        # node embedding 
+        if self.one_hot:
+            x_scalar = self.node_embed(at_no)
+        else:
+            x = self.int2c1e(at_no) 
+            x_scalar = self.node_lin(x)
         # calculate radial basis function
         rbf = self.rbf(dist)
         fcut = self.cutoff_fn(dist)
         # calculate spherical harmonics
-        rsh = self.sph_harm(vec)  # unit vector, normalized by component
+        rsh = self.sph_harm(vec[:, [1, 2, 0]])  # unit vector, normalized by component
         return x_scalar, rbf, fcut, rsh
 
 

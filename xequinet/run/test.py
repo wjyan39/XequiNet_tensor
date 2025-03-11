@@ -175,8 +175,10 @@ def test_polar(model, test_loader, device, outfile, verbose=0):
 def test_cart_tensor(model, test_loader, device, outfile, verbose=0):
     p_unit, _ = get_default_unit()
     sum_mae, sum_mse = 0.0, 0.0
+    sum_l2_norm_dist = 0.0
     mean, m2 = 0.0, 0.0
     count = 0
+    num_samples = 0 
     wf = open(outfile, 'a')
     for data in test_loader:  
         data = data.to(device)
@@ -185,6 +187,10 @@ def test_cart_tensor(model, test_loader, device, outfile, verbose=0):
         error = real - pred
         sum_mae += error.abs().sum().item()
         sum_mse += error.pow(2).sum().item()
+        # l2 metric 
+        cur_num_sample = real.shape[0]
+        batch_l2_norm_dist = torch.sqrt(error.pow(2).view(cur_num_sample, -1).sum(-1))
+        sum_l2_norm_dist += batch_l2_norm_dist.sum().item()
         # 
         batch_size = real.numel() 
         new_count = count + batch_size 
@@ -195,12 +201,60 @@ def test_cart_tensor(model, test_loader, device, outfile, verbose=0):
         corr = batch_size * count / new_count 
         m2 += batch_m2 + delta ** 2 * corr 
         count = new_count  
+        num_samples += cur_num_sample
     var = m2 / count
     mae = sum_mae / count 
     mse = sum_mse / count
+    l2_norm_dist = sum_l2_norm_dist / num_samples 
     rmse = math.sqrt(mse)
     r2 = 1 - mse / var
-    wf.write(f"Test MAE: {mae:12.7f} {p_unit}, RMSE {rmse:12.7f} {p_unit}, R2  {r2:12.7f} \n")
+    wf.write(f"Test MAE: {mae:12.7f} {p_unit}, RMSE {rmse:12.7f} {p_unit}, L2 distance {l2_norm_dist:12.7f}, {p_unit}, R2 {r2:12.7f} \n")
+    wf.close()
+
+
+@torch.no_grad()
+def test_cart_tensor_fnorm(model, order, test_loader, device, outfile):
+    p_unit, _ = get_default_unit()
+    sum_fnorm = 0.0
+    wt_count = [0, 0, 0]
+    num_samples = 0 
+    symmetry_index = [0, 1, 2, 4, 5, 8]
+    wf = open(outfile, 'a')
+    for data in test_loader:  
+        data = data.to(device)
+        pred = model(data)
+        real = data.y
+        cur_num_sample = real.shape[0]
+        if order == 3:
+            pred = pred.view(cur_num_sample, 3, 9)[:, :, symmetry_index] 
+            real = real.view(cur_num_sample, 3, 9)[:, :, symmetry_index] 
+        elif order == 4:
+            pred = pred.view(cur_num_sample, 9, 9)[:, symmetry_index, symmetry_index]
+            real = real.view(cur_num_sample, 9, 9)[: symmetry_index, symmetry_index] 
+        error = real - pred
+        # fnorm metric 
+        batch_fnorm_err = torch.sqrt(error.pow(2).view(cur_num_sample, -1).sum(-1))
+        batch_fnorm_real = torch.sqrt(real.pow(2).view(cur_num_sample, -1).sum(-1))
+        # fetch zero 
+        batch_eq_index = torch.where(batch_fnorm_real.abs() <= 1e-4)
+        batch_err_index = torch.where(batch_fnorm_real.abs() > 1e-4)
+        cur_eq = torch.count_nonzero(torch.where((batch_fnorm_err[batch_eq_index]).abs() <= 1e-4, 1, 0)).item()      
+        cur_wt_count_25 = torch.count_nonzero(torch.where(batch_fnorm_err[batch_err_index] / batch_fnorm_real[batch_err_index] < 0.25, 1, 0)).item()
+        cur_wt_count_10 = torch.count_nonzero(torch.where(batch_fnorm_err[batch_err_index] / batch_fnorm_real[batch_err_index] < 0.10, 1, 0)).item() 
+        cur_wt_count_5 = torch.count_nonzero(torch.where(batch_fnorm_err[batch_err_index] / batch_fnorm_real[batch_err_index] < 0.05, 1, 0)).item()
+        wt_count[0] += cur_wt_count_25
+        wt_count[1] += cur_wt_count_10
+        wt_count[2] += cur_wt_count_5
+        wt_count[0] += cur_eq 
+        wt_count[1] += cur_eq 
+        wt_count[2] += cur_eq 
+        sum_fnorm += torch.sqrt(error.pow(2).view(cur_num_sample, -1).sum(-1)).sum().item()
+        num_samples += cur_num_sample
+    # calculate Frobenius norm
+    fnorm = sum_fnorm / num_samples
+    EwT25, EwT10, EwT5 = 100 * wt_count[0] / num_samples, 100 * wt_count[1] / num_samples, 100 * wt_count[2] / num_samples
+    wf.write(f"Fnorm {fnorm:12.6f} {p_unit} \n")
+    wf.write(f"EwT 25% {EwT25:6.2f},\t 10% {EwT10:6.2f},\t 5% {EwT5:6.2f} \n")
     wf.close()
 
 
@@ -339,7 +393,9 @@ def main():
             else:
                 required_elements = ["H", "C", "N", "O", "F"]
             test_csc(model, test_loader, device, output_file, required_elements)
-        else:
+        elif args.verbose == 1:
+            test_cart_tensor_fnorm(model, config.order, test_loader, device, output_file)
+        else: 
             test_cart_tensor(model, test_loader, device, output_file, args.verbose)
     else:
         test_scalar(model, test_loader, device, output_file, config.output_dim, args.verbose)
