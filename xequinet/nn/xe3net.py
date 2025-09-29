@@ -10,7 +10,7 @@ from e3nn import o3
 from torch_scatter import scatter 
 
 from .tensorproduct import get_feasible_tp 
-from .o3layer import resolve_actfn, Gate, Int2c1eEmbedding
+from .o3layer import resolve_actfn, resolve_o3norm, Gate, Int2c1eEmbedding
 from .rbf import resolve_rbf, resolve_cutoff 
 
 
@@ -97,6 +97,7 @@ class GraphConv(nn.Module):
         irreps_node_out: Union[str, o3.Irreps, Iterable],
         num_basis: int = 16, 
         actfn: str = "silu",
+        norm_type: str = "layer",
         use_gate_activation:bool = True,
     ):
         super().__init__() 
@@ -105,6 +106,7 @@ class GraphConv(nn.Module):
         max_l = self.irreps_node_out.lmax
         self.irreps_rshs = o3.Irreps.spherical_harmonics(max_l)
         self.actfn = resolve_actfn(actfn)
+        self.o3norm = resolve_o3norm(norm_type, self.irreps_node_in)
         self.use_gate_activation = use_gate_activation and self.irreps_node_in == self.irreps_node_out
 
         self.irreps_tp_out, instructions = get_feasible_tp(
@@ -137,7 +139,8 @@ class GraphConv(nn.Module):
         edge_rshs:torch.Tensor, 
         edge_index:torch.LongTensor
     ):
-        x = self.lin_node_pre(node_feat) 
+        node_in:torch.Tensor = self.o3norm(node_feat)
+        x = self.lin_node_pre(node_in) 
         x_j = x[edge_index[1], :] 
         msg_j = self.tp(x_j, edge_rshs, self.mlp_edge_rbf(edge_attr)) 
         accu_msg = scatter(msg_j, edge_index[0], dim=0, dim_size=node_feat.size(0)) 

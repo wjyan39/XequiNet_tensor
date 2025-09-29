@@ -1,4 +1,4 @@
-from typing import Iterable, Union, Tuple, Optional, List 
+from typing import Iterable, Union, Tuple, Optional, List, Dict
 
 import math
 
@@ -11,6 +11,7 @@ from e3nn import o3
 from .o3layer import Gate, resolve_actfn, resolve_o3norm
 from .tensorproduct import get_feasible_tp
 from ..utils.config import NetConfig
+from ..utils.qc import ELEMENTS_DICT
 
 
 class ScalarOut(nn.Module):
@@ -448,6 +449,103 @@ class CartTensorOut(nn.Module):
             return res_cart 
 
 
+class CartTensorMix2(nn.Module):
+    def __init__(
+        self,
+        node_dim: int = 128,
+        edge_irreps: Union[str, o3.Irreps, Iterable] = "128x0e + 64x1o + 32x2e",
+        hidden_dim: int = 64,
+        hidden_irreps: Union[str, o3.Irreps, Iterable] = "16x0e + 16x1o + 16x2e",
+        order: int = 2,
+        required_symmetry: str = "ij",
+        vector_space: Optional[dict] = None,
+        output_dim: int = 9,
+        actfn: str = "silu",
+        reduce_op: Optional[str] = "sum",
+    ):
+        super().__init__()
+        self.irreps_in = edge_irreps if isinstance(edge_irreps, o3.Irreps) else o3.Irreps(edge_irreps)
+        self.irreps_hidden = hidden_irreps if isinstance(hidden_irreps, o3.Irreps) else o3.Irreps(hidden_irreps)
+        lmin = min(self.irreps_in.lmax, self.irreps_hidden.lmax)
+        assert lmin * 2 >= order, f"Input irreps must have 2*lmax >= order, got lmax={lmin} and order={order}."
+        self.trace_out = output_dim == 1 and order == 2 
+        self.indices = required_symmetry.split("=")[0].replace("-", "")
+        vec_space = vector_space if vector_space is not None else {i: "1o" for i in self.indices}
+        # determine various metadata
+        if output_dim == 3**(order) or self.trace_out:
+            rtp = o3.ReducedTensorProducts(formula=required_symmetry, **vec_space) 
+        else:
+            raise NotImplementedError(f"Current CartTensorOut module does not support the required output dim={output_dim}, please check.")
+        self.rtp = rtp 
+        self.irreps_out = self.rtp.irreps_out 
+        self.activation = resolve_actfn(actfn)
+        self.reduce_op = reduce_op 
+        # tensor product path 
+        irreps_tp_out, instructions = get_feasible_tp(
+            self.irreps_hidden, self.irreps_hidden, self.irreps_out, "uuw",
+        )
+        self.tp = o3.TensorProduct(
+            self.irreps_hidden,
+            self.irreps_hidden,
+            irreps_tp_out,
+            instructions=instructions,
+            internal_weights=False,
+            shared_weights=False,
+        )
+        # gate block 
+        self.lin_out_U = o3.Linear(self.irreps_in, self.irreps_hidden, biases=False) 
+        self.lin_out_V = o3.Linear(self.irreps_in, self.irreps_hidden, biases=False)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(node_dim, hidden_dim, bias=True),
+            self.activation,
+            nn.Linear(hidden_dim, self.tp.weight_numel, bias=True)
+        )
+        if irreps_tp_out == self.irreps_out:
+            self.post_trans = False 
+        else:
+            self.post_trans = True
+            self.lin_out_post = o3.Linear(irreps_tp_out, self.irreps_out, biases=False) 
+        self.register_buffer("cartesian_index", torch.LongTensor([2, 0 ,1]))
+
+    def forward(
+        self,
+        data: Data,
+        x_scalar: torch.Tensor,
+        x_spherical: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            `data`: pyg `Data` object.
+            `x_scalar`: Scalar features.
+            `x_spherical`: Spherical features.
+        Returns:
+            `res`: high-order `Tensor` output.
+        """
+        batch = data.batch
+        x_sph_U = self.lin_out_U(x_spherical)
+        x_sph_V = self.lin_out_V(x_spherical)
+        tp_weights = self.gate_mlp(x_scalar)
+        x_tp = self.tp(x_sph_U, x_sph_V, tp_weights) 
+        atom_out = self.lin_out_post(x_tp) if self.post_trans else x_tp
+        if self.reduce_op is not None:
+            res_sph = scatter(atom_out, batch, dim=0, reduce=self.reduce_op)
+        else:
+            res_sph = atom_out 
+        # cartesian transform 
+        Q = self.rtp.change_of_basis
+        res_cart = res_sph @ Q.flatten(-len(self.indices))
+        shape = list(res_sph.shape[:-1]) + list(Q.shape[1:])
+        res_cart = res_cart.view(shape)
+        if self.trace_out:
+            res = torch.diagonal(res_cart, dim1=-2, dim2=-1).sum(dim=-1) / 3
+            return res
+        else:
+            # permute (y, z, x) to (x, y, z)
+            for i_dim in range(1, len(self.indices)+1):
+                res_cart = torch.index_select(res_cart, dim=-i_dim, index=self.cartesian_index)
+            return res_cart 
+        
+
 class CSCOut(nn.Module):
     """
     Output Module for chemical shielding tensors as well as general atom-wise order-2 tensor.
@@ -523,6 +621,97 @@ class CSCOut(nn.Module):
             for i_dim in range(1, 3):
                 res_cart = torch.index_select(res_cart, dim=-i_dim, index=self.cartesian_index)
             return res_cart 
+
+
+class ShiftOut(nn.Module):
+    """
+    Output Module for learning the trace of atomic rank-2 tensor.
+    Espescially for chemical shift via transfer learning from shielding results. 
+    """
+    def __init__(
+        self,
+        node_dim: int = 128,
+        edge_irreps: Union[str, o3.Irreps, Iterable] = "128x0e + 64x1o + 32x2e",
+        hidden_dim: int = 64,
+        hidden_irreps: Union[str, o3.Irreps, Iterable] = "16x0e + 16x1o + 16x2e",
+        actfn: str = "silu",
+        node_slope: Union[float, Dict[str, float]] = -1.0,
+        node_bias: Union[float, Dict[str, float], None] = None,
+    ):
+        super().__init__()
+        self.irreps_in = edge_irreps if isinstance(edge_irreps, o3.Irreps) else o3.Irreps(edge_irreps)
+        self.irreps_hidden = hidden_irreps if isinstance(hidden_irreps, o3.Irreps) else o3.Irreps(hidden_irreps)
+        rtp = o3.ReducedTensorProducts(formula="ij", **{i: "1o" for i in "ij"}) 
+        self.irreps_out = o3.Irreps("1x0e + 1x1e + 1x2e")
+        self.activation = resolve_actfn(actfn)
+        # tensor product path 
+        irreps_tp_out, instructions = get_feasible_tp(
+            self.irreps_hidden, self.irreps_hidden, self.irreps_out, "uuw",
+        )
+        self.tp = o3.TensorProduct(
+            self.irreps_hidden,
+            self.irreps_hidden,
+            irreps_tp_out,
+            instructions=instructions,
+            internal_weights=False,
+            shared_weights=False,
+        )
+        # gate block 
+        self.lin_out_pre = o3.Linear(self.irreps_in, self.irreps_hidden, biases=False) 
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(node_dim, hidden_dim, bias=True),
+            self.activation,
+            nn.Linear(hidden_dim, self.tp.weight_numel, bias=True)
+        )
+        self._gen_buffer(node_bias, node_slope)
+        self.register_buffer("change_of_basis", rtp.change_of_basis)
+    
+    def _gen_buffer(self, node_bias, node_slope):
+        # metadata 
+        elem_slope = torch.ones(len(ELEMENTS_DICT))
+        elem_ref = torch.zeros(len(ELEMENTS_DICT))
+        if node_bias is None:
+            self.register_buffer("shift_ref", elem_ref)
+        elif isinstance(node_bias, float):
+            elem_ref += node_bias
+            self.register_buffer("shift_ref", elem_ref)
+        else:
+            for k, v in node_bias.items():
+                if k in ELEMENTS_DICT:
+                    elem_ref[ELEMENTS_DICT[k]] = v 
+            self.register_buffer("shift_ref", elem_ref)
+        
+        if isinstance(node_slope, float):
+            elem_slope *= node_slope
+            self.register_buffer("shift_slope", elem_slope)
+        else:
+            for k, v in node_slope.items():
+                if k in ELEMENTS_DICT:
+                    elem_slope[ELEMENTS_DICT[k]] = v 
+            self.register_buffer("shift_slope", elem_slope)
+    
+    def forward(
+        self,
+        data: Data,
+        x_scalar: torch.Tensor,
+        x_spherical: torch.Tensor,
+    ) -> torch.Tensor:
+        x_sph = self.lin_out_pre(x_spherical)
+        tp_weights = self.gate_mlp(x_scalar)
+        atom_out = self.tp(x_sph, x_sph, tp_weights) 
+        
+        # cartesian transform 
+        Q = self.change_of_basis
+        res_cart = atom_out @ Q.flatten(-2)
+        shape = list(atom_out.shape[:-1]) + list(Q.shape[1:])
+        res_cart = res_cart.view(shape)
+        
+        res_trace = torch.diagonal(res_cart, dim1=-2, dim2=-1).sum(dim=-1) / 3
+        # model shift out 
+        node_ref = self.shift_ref[data.at_no]
+        node_shift = self.shift_slope[data.at_no]
+        res = node_shift * res_trace + node_ref 
+        return res 
 
 
 class GeneralOut(nn.Module):
@@ -750,6 +939,157 @@ class CartTensorTP(nn.Module):
             return res_cart 
 
 
+class CartTenGate(nn.Module):
+    def __init__(
+        self,
+        node_dim: int = 128,
+        edge_irreps: Union[str, o3.Irreps, Iterable] = "128x0e + 64x1o + 32x2e",
+        hidden_dim: int = 64,
+        hidden_irreps_dim: int = 32,
+        order: int = 2,
+        required_symmetry: str = "ij",
+        output_dim: int = 9,
+        actfn: str = "silu",
+        reduce_op: Optional[str] = "sum",
+    ):
+        super().__init__()
+        self.irreps_in = edge_irreps if isinstance(edge_irreps, o3.Irreps) else o3.Irreps(edge_irreps)
+        self.order = order 
+        self.output_dim = output_dim
+        self.indices = required_symmetry.split("=")[0].replace("-", "") 
+        if self.order == 0 or self.output_dim == 1:
+            self.irreps_out = o3.Irreps(f"{self.output_dim}x0e") 
+        else:
+            self.rtp = o3.ReducedTensorProducts(formula=required_symmetry, **{i: "1o" for i in self.indices}) 
+            self.irreps_out = self.rtp.irreps_out 
+        # hidden_irreps = [(hidden_irreps_dim, (l, p)) for _, (l, p) in self.irreps_out]
+        # self.hidden_irreps = o3.Irreps(hidden_irreps)
+        self.activation = resolve_actfn(actfn)
+        self.reduce_op = reduce_op 
+        self.register_buffer("cartesian_index", torch.LongTensor([2, 0 ,1]))
+        
+        self.scalar_out_mlp = nn.Sequential(
+            nn.Linear(node_dim, hidden_dim),
+            resolve_actfn(actfn),
+            nn.Linear(hidden_dim, self.irreps_out.num_irreps),
+        )
+        nn.init.zeros_(self.scalar_out_mlp[0].bias)
+        nn.init.zeros_(self.scalar_out_mlp[2].bias)
+        self.spherical_out_mlp = nn.Sequential(
+            # o3.Linear(self.irreps_in, self.hidden_irreps),
+            # Gate(self.hidden_irreps),
+            # o3.Linear(self.hidden_irreps, self.irreps_out),
+            o3.Linear(self.irreps_in, self.irreps_out)
+        )
+        self.scalar_mul = o3.ElementwiseTensorProduct(self.irreps_out, f"{self.irreps_out.num_irreps}x0e")
+    
+    def forward(
+        self,
+        data: Data,
+        x_scalar: torch.Tensor,
+        x_spherical: torch.Tensor,
+    ) -> torch.Tensor:
+        batch = data.batch
+        spherical_out = self.spherical_out_mlp(x_spherical)
+        scalar_out = self.scalar_out_mlp(x_scalar)
+        atom_out = self.scalar_mul(spherical_out, scalar_out)
+
+        if self.reduce_op is not None:
+            res_sph = scatter(atom_out, batch, dim=0, reduce=self.reduce_op)
+        else:
+            res_sph = atom_out
+
+        # cartesian transform 
+        if self.order == 0 or self.output_dim == 1:
+            res = res_sph
+        else:
+            Q = self.rtp.change_of_basis
+            res_cart = res_sph @ Q.flatten(-len(self.indices)) 
+            shape = list(res_sph.shape[:-1]) + list(Q.shape[1:])
+            res_cart = res_cart.view(shape) 
+            # permute (y, z, x) to (x, y, z)
+            for i_dim in range(1, len(self.indices)+1):
+                res_cart = torch.index_select(res_cart, dim=-i_dim, index=self.cartesian_index)
+            res = res_cart 
+        return res 
+        
+
+class CartTenLinEqui(nn.Module):
+    """
+    Equivariant Readout Module via simple O(3) Linear transform for Cartesian tensor prediction.
+    Note this module is just for Naive EGCN with single feat channel, and does not support XPaiNN 
+    message passing block as the scalar hidden feature is not actually used in the forward, which 
+    will cause unreceived gradients during back-propagation. 
+    """
+    def __init__(
+        self,
+        irreps_in: Union[str, o3.Irreps, Iterable] = "128x0e + 64x1o + 32x2e",
+        hidden_irreps: Union[str, o3.Irreps, Iterable] = "16x0e + 16x1o + 16x2e",
+        order: int = 2,
+        required_symmetry: str = "ij",
+        vector_space: Optional[dict] = None,
+        output_dim: int = 9,
+        actfn: str = "silu",
+        reduce_op: Optional[str] = "sum",
+    ):
+        super().__init__()
+        self.irreps_in = irreps_in if isinstance(irreps_in, o3.Irreps) else o3.Irreps(irreps_in)
+        self.irreps_hidden = hidden_irreps if isinstance(hidden_irreps, o3.Irreps) else o3.Irreps(hidden_irreps)
+        assert self.irreps_hidden.lmax >= order, f"Hidden irreps must have lmax >= order, got lmax={self.irreps_hidden.lmax} and order={order}."
+        # determine various metadata
+        self.indices = required_symmetry.split("=")[0].replace("-", "")
+        vec_space = vector_space if vector_space is not None else {i: "1o" for i in self.indices}
+        self.trace_out = output_dim == 1 and order == 2 
+        if output_dim == 3**(order) or self.trace_out:
+            rtp = o3.ReducedTensorProducts(formula=required_symmetry, **vec_space) 
+        else:
+            raise NotImplementedError(f"Current CartTensorOut module does not support the required output dim={output_dim}, please check.")
+        self.rtp = rtp 
+        self.irreps_out = self.rtp.irreps_out 
+
+        self.equi_readout = nn.Sequential(
+            o3.Linear(self.irreps_in, self.irreps_hidden, biases=False),
+            Gate(self.irreps_hidden),
+            o3.Linear(self.irreps_hidden, self.irreps_out, biases=False),
+        )        
+        self.reduce_op = reduce_op 
+        self.register_buffer("cartesian_index", torch.LongTensor([2, 0 ,1]))
+    
+    def forward(
+        self,
+        data: Data,
+        x_scalar: torch.Tensor,
+        x_spherical: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            `data`: pyg `Data` object.
+            `x_scalar`: Scalar features.
+            `x_spherical`: Spherical features.
+        Returns:
+            `res`: high-order `Tensor` output.
+        """
+        batch = data.batch
+        atom_out = self.equi_readout(x_spherical)
+        if self.reduce_op is not None:
+            res_sph = scatter(atom_out, batch, dim=0, reduce=self.reduce_op)
+        else:
+            res_sph = atom_out 
+        # cartesian transform 
+        Q = self.rtp.change_of_basis
+        res_cart = res_sph @ Q.flatten(-len(self.indices))
+        shape = list(res_sph.shape[:-1]) + list(Q.shape[1:])
+        res_cart = res_cart.view(shape)
+        if self.trace_out:
+            res = torch.diagonal(res_cart, dim1=-2, dim2=-1).sum(dim=-1) / 3
+            return res
+        else:
+            # permute (y, z, x) to (x, y, z)
+            for i_dim in range(1, len(self.indices)+1):
+                res_cart = torch.index_select(res_cart, dim=-i_dim, index=self.cartesian_index)
+            return res_cart 
+
+
 
 def resolve_output(config: NetConfig):
     if config.output_mode == "scalar":
@@ -811,6 +1151,19 @@ def resolve_output(config: NetConfig):
             actfn=config.activation,
             reduce_op=config.reduce_op,
         )
+    elif config.output_mode == "cart_tensor_mix":
+        return CartTensorMix2(
+            node_dim=config.node_dim,
+            edge_irreps=config.edge_irreps,
+            hidden_dim=config.hidden_dim,
+            hidden_irreps=config.hidden_irreps,
+            order=config.order,
+            required_symmetry=config.required_symm,
+            vector_space=config.vector_space,
+            output_dim=config.output_dim,
+            actfn=config.activation,
+            reduce_op=config.reduce_op,
+        )
     elif config.output_mode == "cart_tensor_tp":
         return CartTensorTP(
             node_dim=config.node_dim,
@@ -825,6 +1178,29 @@ def resolve_output(config: NetConfig):
             actfn=config.activation,
             reduce_op=config.reduce_op,
         )
+    elif config.output_mode == "cart_tensor_lin":
+        return CartTenLinEqui(
+            irreps_in=config.edge_irreps,
+            hidden_irreps=config.hidden_irreps,
+            order=config.order,
+            required_symmetry=config.required_symm,
+            vector_space=config.vector_space,
+            output_dim=config.output_dim,
+            actfn=config.activation,
+            reduce_op=config.reduce_op,
+        )
+    elif config.output_mode == "cart_tensor_gate":
+        return CartTenGate(
+            node_dim=config.node_dim,
+            edge_irreps=config.edge_irreps,
+            hidden_dim=config.hidden_dim,
+            hidden_irreps_dim=32,
+            order=config.order,
+            required_symmetry=config.required_symm,
+            output_dim=config.output_dim,
+            actfn=config.activation,
+            reduce_op=config.reduce_op,
+        )
     elif config.output_mode == "atomic_shielding":
         return CSCOut(
             node_dim=config.node_dim,
@@ -835,6 +1211,16 @@ def resolve_output(config: NetConfig):
             vector_space=config.vector_space,
             trace_out=config.output_dim==1,
             actfn=config.activation,
+        )
+    elif config.output_mode == "chemical_shifts":
+        return ShiftOut(
+            node_dim=config.node_dim,
+            edge_irreps=config.edge_irreps,
+            hidden_dim=config.hidden_dim,
+            hidden_irreps=config.hidden_irreps,
+            actfn=config.activation,
+            # node_slope=config.node_slope, # frozen to -1.0
+            node_bias=config.node_ref,
         )
     else:
         raise NotImplementedError(f"output mode {config.output_mode} is not implemented")

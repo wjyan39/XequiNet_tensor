@@ -481,8 +481,7 @@ class GradTrainer(Trainer):
 
 class CSCTrainer(Trainer):
     """
-    Trainer class for general matrice properties calculated from quantum chemistry method
-    with a given basis set layout.
+    Trainer class for Chemical Shielding Tensors/Constants as well as Shifts.
     """
     def __init__(
         self, 
@@ -495,8 +494,15 @@ class CSCTrainer(Trainer):
         log: ZeroLogger,
     ):
         super().__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
-        self.target_elem = ELEMENTS_DICT[config.target_elem] if isinstance(config.target_elem, str) else config.target_elem
-        self.trace_out = config.output_dim == 1  
+        if config.target_elem is not None:
+            if isinstance(config.target_elem[0], str):
+                self.target_elem = [ELEMENTS_DICT[ele] for ele in config.target_elem]
+            else:
+                self.target_elem = config.target_elem
+        else:
+            self.target_elem = None
+        self.trace_out = config.output_dim == 1 
+        # self.lossfn = resolve_lossfn(config.lossfn, reduction="none")
     
     def train1epoch(self):
         self.model.train()
@@ -505,16 +511,37 @@ class CSCTrainer(Trainer):
         for step, data in enumerate(self.train_loader, start=1):
             self.meter.reset()
             data = data.to(self.device) 
+            # generate the node mask 
+            if hasattr(data, "label_mask"):
+                batch_label_mask = data.label_mask
+            else:
+                batch_label_mask = torch.ones(data.y.shape[0], dtype=torch.bool, device=self.device)
+            if self.target_elem is not None:
+                batch_elem_mask = torch.zeros(data.y.shape[0], dtype=torch.bool, device=self.device)
+                for ele in self.target_elem:
+                    batch_elem_mask = torch.logical_or(batch_elem_mask, data.at_no == ele)
+                batch_node_mask = torch.logical_and(batch_label_mask, batch_elem_mask) 
+            else:
+                batch_node_mask = batch_label_mask
             # forward propagation
             res = self.model(data)
-            batch_node_mask = data.at_no == self.target_elem 
-            if self.trace_out: 
-                pred = res[batch_node_mask]
-                real = data.y - data.base_y if hasattr(data, "base_y") else data.y
-                real = real[batch_node_mask]
+            # mask the results 
+            non_label = torch.all(batch_node_mask == False)
+            all_label = torch.all(batch_node_mask == True)
+            if non_label:
+                real = res.detach().clone()
+                pred = res 
+            elif all_label:
+                real = data.y - data.base_y if hasattr(data, "base_y") else data.y 
+                pred = res 
             else:
-                pred = res[batch_node_mask, ...]
-                real = data.y[batch_node_mask, ...]
+                if self.trace_out: 
+                    pred = res[batch_node_mask]
+                    real = data.y - data.base_y if hasattr(data, "base_y") else data.y
+                    real = real[batch_node_mask]
+                else:
+                    pred = res[batch_node_mask, ...]
+                    real = data.y[batch_node_mask, ...]
             loss = self.lossfn(pred, real)
             # backward propagation
             self.optimizer.zero_grad()
@@ -557,7 +584,17 @@ class CSCTrainer(Trainer):
             for data in self.valid_loader:
                 data = data.to(self.device)
                 res = self.model(data)
-                batch_node_mask = data.at_no == self.target_elem 
+                if hasattr(data, "label_mask"):
+                    batch_label_mask = data.label_mask
+                else:
+                    batch_label_mask = torch.ones(data.y.shape[0], dtype=torch.bool, device=self.device)
+                if self.target_elem is not None:
+                    batch_elem_mask = torch.zeros(data.y.shape[0], dtype=torch.bool, device=self.device)
+                    for ele in self.target_elem:
+                        batch_elem_mask = torch.logical_or(batch_elem_mask, data.at_no == ele)
+                    batch_node_mask = torch.logical_and(batch_label_mask, batch_elem_mask)  
+                else:
+                    batch_node_mask = batch_label_mask
                 if self.trace_out: 
                     pred = res[batch_node_mask]
                     real = data.y - data.base_y if hasattr(data, "base_y") else data.y
@@ -587,7 +624,17 @@ class CSCTrainer(Trainer):
             for data in self.valid_loader:
                 data = data.to(self.device)
                 res = self.ema_model(data)
-                batch_node_mask = data.at_no == self.target_elem 
+                if hasattr(data, "label_mask"):
+                    batch_label_mask = data.label_mask
+                else:
+                    batch_label_mask = torch.ones(data.y.shape[0], dtype=torch.bool, device=self.device)
+                if self.target_elem is not None:
+                    batch_elem_mask = torch.zeros(data.y.shape[0], dtype=torch.bool, device=self.device)
+                    for ele in self.target_elem:
+                        batch_elem_mask = torch.logical_or(batch_elem_mask, data.at_no == ele)
+                    batch_node_mask = torch.logical_and(batch_label_mask, batch_elem_mask)  
+                else:
+                    batch_node_mask = batch_label_mask
                 if self.trace_out: 
                     pred = res[batch_node_mask]
                     real = data.y - data.base_y if hasattr(data, "base_y") else data.y
@@ -607,5 +654,3 @@ class CSCTrainer(Trainer):
             self.early_stop(deviation, self.best_l2fs[0].loss, lr)
         self.save_best_k(self.ema_model.module, deviation)
         self._save_params(self.ema_model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt")
-
-

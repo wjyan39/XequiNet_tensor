@@ -47,9 +47,6 @@ class XEmbedding(nn.Module):
             self.node_lin = nn.Linear(self.int2c1e.embed_dim, self.node_dim)
             nn.init.zeros_(self.node_lin.bias)
             self.one_hot = False 
-        self.int2c1e = Int2c1eEmbedding(embed_basis, aux_basis)
-        self.node_lin = nn.Linear(self.int2c1e.embed_dim, self.node_dim)
-        nn.init.zeros_(self.node_lin.bias)
         self.sph_harm = o3.SphericalHarmonics(self.edge_irreps, normalize=True, normalization="component")
         self.rbf = resolve_rbf(rbf_kernel, num_basis, cutoff)
         self.cutoff_fn = resolve_cutoff(cutoff_fn, cutoff)

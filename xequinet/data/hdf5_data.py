@@ -39,6 +39,8 @@ def set_init_attr(dataset: Dataset, config: NetConfig, **kwargs):
         dataset._prop_dict['force'] = config.force_name
         if config.bforce_name is not None:
             dataset._prop_dict['base_force'] = config.bforce_name
+    if config.label_mask is not None:
+        dataset._prop_dict["label_mask"] = config.label_mask
     
     # virtual dimension is for batch collation
     # e.g. shape of dipole moment is (3,) for a single molecule
@@ -88,6 +90,10 @@ def process_h5(f_h5: h5py.File, mode: str, cutoff: float, prop_dict: str, **kwar
                     p_val = p_val.unsqueeze(0)
                 if virtual_dim and p_attr in ["y", "base_y"]:
                     p_val = p_val.unsqueeze(0)
+                if "index" in p_attr:
+                    p_val = p_val.long()
+                if "mask" in p_attr:
+                    p_val = p_val.bool()
                 setattr(data, p_attr, p_val)
             yield data
 
@@ -154,6 +160,10 @@ def process_pbch5(f_h5: h5py.File, mode: str, cutoff: float, prop_dict: dict, **
                     p_val = p_val.unsqueeze(0)
                 if virtual_dim and p_attr in ["y", "base_y"]:
                     p_val = p_val.unsqueeze(0)
+                if "index" in p_attr:
+                    p_val = p_val.long()
+                if "mask" in p_attr:
+                    p_val = p_val.bool()
                 setattr(data, p_attr, p_val)
             yield data
 

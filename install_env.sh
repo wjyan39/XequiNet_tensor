@@ -1,4 +1,4 @@
-conda create -y -n xequiten python=3.9 numpy scipy h5py
+conda create -y -n xequiten python=3.9 numpy=1.26 scipy h5py
 source activate xequiten
 conda install pytorch==2.0.1 pytorch-cuda==11.7 -c pytorch -c nvidia
 conda install pyg=2.3 -c pyg

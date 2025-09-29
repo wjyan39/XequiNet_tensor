@@ -38,10 +38,12 @@ class NetConfig(BaseModel):
     order: int = 2                                 # rank of output tensor
     required_symm: str = "ij"                      # indices symmetry of the tensor, "ij" for arbitary rank-2 tensor etc.
     vector_space: Optional[dict] = None            # vector space for the output tensor
-    target_elem: Optional[Union[str, int]] = None  # for element-wise training of atomic shielding constant 
+    target_elem: Optional[Union[List[str], List[int]]] = None  # for element-wise training of atomic shielding constant 
     mat_hidden_dim: int = 64                       # hidden dimension of each irrep feature in network
     max_l: int = 4                                 # maximum angular momentum required in network
     irreps_out: Optional[str] = None               # output layout required by user
+    node_slope: Optional[Union[float, dict]] = None  # slope for each node type if using `shift` mode
+    node_ref: Optional[Union[str, dict]] = None      # atomic reference (only for `shift` mode)
 
     # configurations about the dataset
     dataset_type: str = "normal"                   # dataset type (`memory` is for the dataset in memory, `disk` is for the dataset on disk)
@@ -53,6 +55,7 @@ class NetConfig(BaseModel):
     blabel_name: Optional[str] = None              # name of the basis label
     force_name: Optional[str] = None               # name of the force
     bforce_name: Optional[str] = None              # name of the basis force
+    label_mask: Optional[str] = None               # name of the label mask
     label_unit: Optional[str] = None               # unit of the input label
     blabel_unit: Optional[str] = None              # unit of the input base label
     force_unit: Optional[str] = None               # unit of the input force

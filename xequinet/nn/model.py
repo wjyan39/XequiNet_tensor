@@ -152,6 +152,7 @@ class XE3Net(nn.Module):
                 irreps_node_out=config.edge_irreps,
                 num_basis=config.num_basis,
                 actfn=config.activation,
+                norm_type="nonorm" if idx == 0 else config.norm_type,
                 use_gate_activation=False if idx == 0 else True,
             )
             for idx in range(config.action_blocks)

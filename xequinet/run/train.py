@@ -129,6 +129,8 @@ def main():
     # -------------------  train model ------------------- #
     if config.output_mode == "grad":
         from xequinet.utils import GradTrainer as MyTrainer
+    elif config.output_mode in ["chemical_shielding", "chemical_shifts"]:
+        from xequinet.utils import CSCTrainer as MyTrainer 
     else:
         from xequinet.utils import Trainer as MyTrainer
     trainer = MyTrainer(ddp_model, config, device, train_loader, valid_loader, train_sampler, log)

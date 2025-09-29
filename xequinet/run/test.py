@@ -172,7 +172,7 @@ def test_polar(model, test_loader, device, outfile, verbose=0):
 
 
 @torch.no_grad()
-def test_cart_tensor(model, test_loader, device, outfile, verbose=0):
+def test_cart_tensor(model, test_loader, device, outfile):
     p_unit, _ = get_default_unit()
     sum_mae, sum_mse = 0.0, 0.0
     sum_l2_norm_dist = 0.0
@@ -205,10 +205,11 @@ def test_cart_tensor(model, test_loader, device, outfile, verbose=0):
     var = m2 / count
     mae = sum_mae / count 
     mse = sum_mse / count
-    l2_norm_dist = sum_l2_norm_dist / num_samples 
+    # calculate Frobenius norm
+    l2_norm_dist = sum_l2_norm_dist / num_samples
     rmse = math.sqrt(mse)
     r2 = 1 - mse / var
-    wf.write(f"Test MAE: {mae:12.7f} {p_unit}, RMSE {rmse:12.7f} {p_unit}, L2 distance {l2_norm_dist:12.7f}, {p_unit}, R2 {r2:12.7f} \n")
+    wf.write(f"Test MAE: {mae:12.7f} {p_unit}, RMSE {rmse:12.7f} {p_unit}, L2 distance {l2_norm_dist:12.7f} {p_unit}, R2  {r2:12.7f} \n")
     wf.close()
 
 
@@ -230,7 +231,7 @@ def test_cart_tensor_fnorm(model, order, test_loader, device, outfile):
             real = real.view(cur_num_sample, 3, 9)[:, :, symmetry_index] 
         elif order == 4:
             pred = pred.view(cur_num_sample, 9, 9)[:, symmetry_index, symmetry_index]
-            real = real.view(cur_num_sample, 9, 9)[: symmetry_index, symmetry_index] 
+            real = real.view(cur_num_sample, 9, 9)[:, symmetry_index, symmetry_index] 
         error = real - pred
         # fnorm metric 
         batch_fnorm_err = torch.sqrt(error.pow(2).view(cur_num_sample, -1).sum(-1))
@@ -260,30 +261,37 @@ def test_cart_tensor_fnorm(model, order, test_loader, device, outfile):
 
 @torch.no_grad()
 def test_csc(model, test_loader, device, outfile, required_elements=None):
-    p_unit = "ppm" 
+    p_unit, _ = get_default_unit() 
     error_dict = {"total":{"sum_mae": 0.0, "sum_mse": 0.0, "count": 0, "mean": 0.0, "m2": 0.0}} 
     for ele in required_elements:
         error_dict[ele] = {"sum_mae": 0.0, "sum_mse": 0.0, "count": 0, "mean": 0.0, "m2": 0.0} 
     wf = open(outfile, 'a')
     for data in test_loader:  
         data = data.to(device)
-        pred = model(data)
-        real = data.y
+        res = model(data) 
+        label = data.y 
+        # pred = model(data)
+        # real = data.y
+        if hasattr(data, "label_mask"):
+            batch_label_mask = data.label_mask 
+        else:
+            batch_label_mask = torch.ones_like(data.at_no).bool().to(device)
         for key_name in error_dict.keys():
             if key_name == "total":
-                node_mask = torch.ones_like(real).bool().to(device)
+                node_mask = batch_label_mask 
             else:
                 cur_at_no = ELEMENTS_DICT[key_name]
-                node_mask = data.at_no == cur_at_no
-            error = real[node_mask] - pred[node_mask]
+                node_mask = torch.logical_and(batch_label_mask, data.at_no == cur_at_no)
+            real, pred = label[node_mask], res[node_mask]
+            error = real - pred
             error_dict[key_name]["sum_mae"] += error.abs().sum().item()
             error_dict[key_name]["sum_mse"] += error.pow(2).sum().item()
-            batch_size = real[node_mask].numel()
+            batch_size = real.numel()
             if batch_size == 0:
                 continue
             new_count = error_dict[key_name]["count"] + batch_size 
-            batch_mean = torch.mean(real[node_mask]) 
-            batch_m2 = torch.sum((real[node_mask] - batch_mean) ** 2)
+            batch_mean = torch.mean(real.view(-1)) 
+            batch_m2 = torch.sum((real.view(-1) - batch_mean) ** 2)
             delta = batch_mean - error_dict[key_name]["mean"] 
             error_dict[key_name]["mean"] += delta * batch_size / new_count 
             corr = batch_size * error_dict[key_name]["count"] / new_count 
@@ -324,6 +332,10 @@ def main():
     parser.add_argument(
         "--no-force", "-nf", action="store_true",
         help="Whether not testing force when the output mode is 'grad'",
+    )
+    parser.add_argument(
+        "--atomic", "-A", default=False, action="store_true",
+        help="Whether to save atomic info.",
     )
     parser.add_argument(
         "--verbose", "-v", type=int, default=0, choices=[0, 1, 2],
@@ -386,17 +398,26 @@ def main():
         test_vector(model, test_loader, device, output_file, args.verbose)
     elif config.output_mode == "polar" and config.output_dim == 9:
         test_polar(model, test_loader, device, output_file, args.verbose)
-    elif config.output_mode in ["cart_tensor", "cart_tensor_tp", "atomic_shielding"]:
+    elif config.output_mode in ["chemical_shielding", "chemical_shifts", "atomic_shielding"]:
+        if config.output_dim == 1:
+            required_elements = config.target_elem if config.target_elem is not None else ["H", "C"]
+            test_csc(model, test_loader, device, output_file, required_elements)
+        else:
+            test_cart_tensor(model, test_loader, device, output_file, args.verbose)
+    elif config.output_mode in ["cart_tensor", "cart_tensor_tp", "cart_tensor_gate", "cart_tensor_lin", "cart_tensor_mix"]:
         if config.output_dim == 1:
             if config.target_elem is not None:
-                required_elements = [config.target_elem]
+                required_elements = config.target_elem
+                test_csc(model, test_loader, device, output_file, required_elements)
             else:
-                required_elements = ["H", "C", "N", "O", "F"]
-            test_csc(model, test_loader, device, output_file, required_elements)
+                test_scalar(model, test_loader, device, output_file, config.output_dim, args.verbose)
         elif args.verbose == 1:
             test_cart_tensor_fnorm(model, config.order, test_loader, device, output_file)
-        else: 
-            test_cart_tensor(model, test_loader, device, output_file, args.verbose)
+        elif args.atomic:
+            required_elements = config.target_elem if config.target_elem is not None else ["O"]
+            test_csc(model, test_loader, device, output_file, required_elements)
+        else:
+            test_cart_tensor(model, test_loader, device, output_file)
     else:
         test_scalar(model, test_loader, device, output_file, config.output_dim, args.verbose)
 
