@@ -2,11 +2,12 @@ from typing import Tuple, List, Optional
 import os
 import heapq
 
+import numpy as np 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch_scatter import scatter
+# from torch_scatter import scatter
 
 from torch.optim.swa_utils import AveragedModel
 from torch_geometric.loader import DataLoader
@@ -21,6 +22,7 @@ from .functional import (
 from .config import NetConfig
 from .logger import ZeroLogger
 from .qc import get_default_unit, ELEMENTS_DICT
+from .qc_matrice_graph import QCMatriceBuilder, OrbitalCalculator
 
 
 class loss2file:
@@ -654,3 +656,683 @@ class CSCTrainer(Trainer):
             self.early_stop(deviation, self.best_l2fs[0].loss, lr)
         self.save_best_k(self.ema_model.module, deviation)
         self._save_params(self.ema_model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt")
+
+
+class GraphMeter:
+    """
+    Meteric class for evaluating error metrics containing both node and edge labels.
+    """
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.reset()
+
+    def reset(self):
+        self.accum_loss = torch.zeros((3,), device=self.device)
+        self.counter = torch.zeros((3,), device=self.device, dtype=torch.int32) 
+
+    def update(self, node_datum: float, edge_datum: float, total_datum, num_node: int, num_edge: int, num_tot):
+        self.accum_loss[0] += node_datum; self.accum_loss[1] += edge_datum; self.accum_loss[2] += total_datum
+        self.counter[0] += num_node; self.counter[1] += num_edge; self.counter[2] += num_tot
+    
+    def reduce(self) -> Tuple[float, float, float]:
+        this_accum_loss = self.accum_loss.clone() 
+        this_counter = self.counter.clone() 
+        dist.all_reduce(this_accum_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(this_counter, op=dist.ReduceOp.SUM) 
+        this_avg = this_accum_loss / this_counter 
+        return this_avg[0].item(), this_avg[1].item(), this_avg[2].item()
+
+
+class QCMatTrainer(Trainer):
+    """
+    Trainer class for general matrice properties calculated from quantum chemistry method
+    with a given basis set layout.
+    """
+    def __init__(
+        self, 
+        model: nn.parallel.DistributedDataParallel, 
+        config: NetConfig,
+        device: torch.device, 
+        train_loader: DataLoader, 
+        valid_loader: DataLoader,
+        dist_sampler: Optional[DistributedSampler], 
+        log: ZeroLogger,
+    ):
+        super().__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
+        self.meter = GraphMeter(self.device) 
+        self.node_weight = config.reg_weight if config.reg_weight > 0.0 else 1.0 
+    
+    def train1epoch(self):
+        self.model.train()
+        self.dist_sampler.set_epoch(self.epoch) 
+        
+        for step, data in enumerate(self.train_loader, start=1):
+            self.meter.reset()
+            data = data.to(self.device) 
+            # forward propagation
+            res = self.model(data)
+            pred_pad_node, pred_pad_edge = res[0], res[1]
+            real_pad_node = data.node_label - data.node_base if hasattr(data, 'node_base') else data.node_label
+            real_pad_edge = data.edge_label - data.edge_base if hasattr(data, 'edge_base') else data.edge_label
+            batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+            pred_node, pred_edge = pred_pad_node[batch_mask_node], pred_pad_edge[batch_mask_edge]
+            real_node, real_edge = real_pad_node[batch_mask_node], real_pad_edge[batch_mask_edge]
+            batch_pred = torch.cat([pred_node, pred_edge], dim=0)
+            batch_real = torch.cat([real_node, real_edge], dim=0)
+            # loss = self.lossfn(batch_pred, batch_real)
+            loss = self.node_weight * self.lossfn(pred_node, real_node) + self.lossfn(pred_edge, real_edge)
+            # backward propagation
+            self.optimizer.zero_grad()
+            loss.backward()
+            # gradient clipping
+            if self.config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip, error_if_nonfinite=True)
+            self.optimizer.step()
+            # update EMA model
+            if self.ema_model is not None:
+                self.ema_model.update_parameters(self.model)
+            # update learning rate
+            if self.config.lr_scheduler != "plateau":
+                with self.warmup_scheduler.dampening():
+                    self.lr_scheduler.step()
+            # record l1 loss
+            with torch.no_grad():
+                l1loss_node = F.l1_loss(pred_node, real_node, reduction="sum")
+                l1loss_edge = F.l1_loss(pred_edge, real_edge, reduction="sum")
+                l1loss_total = F.l1_loss(batch_pred, batch_real, reduction="sum")
+                self.meter.update(l1loss_node.item(), l1loss_edge.item(), l1loss_total.item(), real_node.size(0), real_edge.size(0), batch_real.size(0))
+            # logging
+            if (self.epoch % self.config.log_epoch == 0 and
+                (step % self.config.log_step == 0 or
+                 step == len(self.train_loader))):
+                mae = self.meter.reduce()
+                self.log.f.info(
+                    "Epoch: [{iepoch:>4}][{step:>4}/{nstep}]   lr: {lr:3e}   train MAE: node: {mae_n:10.7f},  edge: {mae_e:10.7f},  total: {mae_tot:10.7f}".format(
+                        iepoch=self.epoch,
+                        step=step,
+                        nstep=len(self.train_loader),
+                        lr=self.optimizer.param_groups[0]["lr"],
+                        mae_n=mae[0],
+                        mae_e=mae[1],
+                        mae_tot=mae[2],
+                    )
+                )
+        
+    def validate(self):
+        self.model.eval()
+        self.meter.reset()
+        with torch.no_grad():
+            for data in self.valid_loader:
+                data = data.to(self.device)
+                res = self.model(data)
+                pred_pad_node, pred_pad_edge = res[0], res[1]
+                batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+                pred_node, pred_edge = pred_pad_node[batch_mask_node], pred_pad_edge[batch_mask_edge]
+                real_node = data.node_label[batch_mask_node] - data.node_base[batch_mask_node] if hasattr(data, 'node_base') else data.node_label[batch_mask_node]
+                real_edge = data.edge_label[batch_mask_edge] - data.edge_base[batch_mask_edge] if hasattr(data, 'edge_base') else data.edge_label[batch_mask_edge]
+                batch_pred = torch.cat([pred_node, pred_edge], dim=0)
+                batch_real = torch.cat([real_node, real_edge], dim=0)
+                node_l1loss = F.l1_loss(pred_node, real_node, reduction="sum")
+                edge_l1loss = F.l1_loss(pred_edge, real_edge, reduction="sum")
+                total_l1loss = F.l1_loss(batch_pred, batch_real, reduction="sum")
+                self.meter.update(node_l1loss.item(), edge_l1loss.item(), total_l1loss.item(), real_node.size(0), real_edge.size(0), batch_real.size(0))
+        mae = self.meter.reduce()
+        self.log.f.info(f"Validation MAE: node: {mae[0]:10.7f}, edge: {mae[1]:10.7f}, total: {mae[2]:10.7f}")
+        total_mae = mae[2]
+        if self.config.lr_scheduler == "plateau":
+            with self.warmup_scheduler.dampening():
+                self.lr_scheduler.step(total_mae)
+            self.early_stop(total_mae, self.best_l2fs[0].loss)
+        self.save_best_k(self.model.module, total_mae)
+        self._save_params(self.model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt") 
+
+    def ema_validate(self):
+        if self.ema_model is None:
+            return
+        self.ema_model.eval()
+        self.meter.reset()
+        with torch.no_grad():
+            for data in self.valid_loader:
+                data = data.to(self.device)
+                res = self.ema_model(data)
+                pred_pad_node, pred_pad_edge = res[0], res[1]
+                batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+                pred_node, pred_edge = pred_pad_node[batch_mask_node], pred_pad_edge[batch_mask_edge]
+                real_node = data.node_label[batch_mask_node] - data.node_base[batch_mask_node] if hasattr(data, 'node_base') else data.node_label[batch_mask_node]
+                real_edge = data.edge_label[batch_mask_edge] - data.edge_base[batch_mask_edge] if hasattr(data, 'edge_base') else data.edge_label[batch_mask_edge]
+                batch_pred = torch.cat([pred_node, pred_edge], dim=0)
+                batch_real = torch.cat([real_node, real_edge], dim=0)
+                node_l1loss = F.l1_loss(pred_node, real_node, reduction="sum")
+                edge_l1loss = F.l1_loss(pred_edge, real_edge, reduction="sum")
+                total_l1loss = F.l1_loss(batch_pred, batch_real, reduction="sum")
+                self.meter.update(node_l1loss.item(), edge_l1loss.item(), total_l1loss.item(), real_node.size(0), real_edge.size(0), batch_real.size(0))
+        mae = self.meter.reduce()
+        self.log.f.info(f"EMA Validation MAE: node: {mae[0]:10.7f}, edge: {mae[1]:10.7f}, total: {mae[2]:10.7f}")
+        total_mae = mae[2]
+        if self.config.lr_scheduler == "plateau":
+            with self.warmup_scheduler.dampening():
+                self.lr_scheduler.step(total_mae)
+            self.early_stop(total_mae, self.best_l2fs[0].loss)
+        self.save_best_k(self.ema_model.module, total_mae)
+        self._save_params(self.ema_model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt")
+
+
+class OrbGradTrainer(QCMatTrainer):
+    """
+    Trainer class additionally add Orbital Gradient as a regularization term.
+    """
+    def __init__(
+        self, 
+        model: nn.parallel.DistributedDataParallel, 
+        config: NetConfig,
+        device: torch.device, 
+        train_loader: DataLoader, 
+        valid_loader: DataLoader,
+        dist_sampler: Optional[DistributedSampler], 
+        log: ZeroLogger,
+    ):
+        super(OrbGradTrainer, self).__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
+        self._set_init(config, device)
+    
+    def _set_init(self, config:NetConfig, device:torch.device):
+        self.mat_builder = QCMatriceBuilder(config.irreps_out, config.possible_elements, config.target_basisname)
+        self.orbital_calculator = OrbitalCalculator(config.target_basisname, config.default_length_unit, config.ortho_transform)
+        self.reg_weight:float = config.reg_weight if config.reg_weight > 0.0 else 1.0
+        self.mat_builder.to(device)
+        self._default_dtype = torch.float64 if config.default_dtype == "float64" else torch.float32 
+        self._device = device
+        if config.output_mode == "orbital":
+            self.full_eigen_space = False 
+        elif config.output_mode == "eigen":
+            self.full_eigen_space = True
+
+    def train1epoch(self):
+        self.model.train()
+        self.dist_sampler.set_epoch(self.epoch) 
+        
+        for step, data in enumerate(self.train_loader, start=1):
+            self.meter.reset()
+            data = data.to(self.device) 
+            # forward propagation
+            res = self.model(data)
+            pred_pad_node, pred_pad_edge = res[0], res[1]
+            real_pad_node, real_pad_edge = data.node_label, data.edge_label
+            batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+            if hasattr(data, 'node_base'):
+                pred_pad_node = pred_pad_node + data.node_base
+            if hasattr(data, 'edge_base'):
+                pred_pad_edge = pred_pad_edge + data.edge_base
+            pred_node, pred_edge = pred_pad_node[batch_mask_node], pred_pad_edge[batch_mask_edge]
+            real_node, real_edge = real_pad_node[batch_mask_node], real_pad_edge[batch_mask_edge]
+            batch_pred = torch.cat([pred_node, pred_edge], dim=0)
+            batch_real = torch.cat([real_node, real_edge], dim=0)
+            # calculate the regularization term  
+            real_fock = self.mat_builder(real_pad_node, real_pad_edge, data.at_no, data.fc_edge_index)
+            real_fock = real_fock.cpu().numpy().astype(np.float64)
+            at_no = data.at_no.cpu().numpy()
+            coords = data.pos.cpu().numpy().astype(np.float64)
+            charge = data.charge.to(torch.long).item()
+            ## orbital coefficients 
+            orb_coeffs, nocc, _ = self.orbital_calculator(real_fock, at_no, coords, charge)
+            ## fock ao 
+            pred_fock = self.mat_builder(pred_pad_node, pred_pad_edge, data.at_no, data.fc_edge_index)
+            real_fock = torch.from_numpy(real_fock).to(self._device).to(self._default_dtype)
+            if not self.full_eigen_space: 
+                ### occupied space + orbital grad
+                ### i.e. Foo + Fvo = C_occ.T @ \delta Fao @ C_occ + C_virt.T @ \delta Fao @ C_occ = C.T @ Fao @ C_occ
+                orb_ket = torch.from_numpy(orb_coeffs).to(self._device).to(self._default_dtype)  # all
+                orb_bra = torch.from_numpy(orb_coeffs[:, :nocc]).to(self._device).to(self._default_dtype).T  # occ
+                ## orbital gradient Fvo = C_virt.T @ Fao @ C_occ 
+                orb_grad = orb_bra @ (pred_fock - real_fock) @ orb_ket
+                reg_loss = torch.norm(orb_grad, p="fro")
+            else:
+                orb_ket = torch.from_numpy(orb_coeffs).to(self._device).to(self._default_dtype)            # all 
+                orb_bra = orb_ket.T 
+                ## wavefunction alignment loss 
+                wa_error = orb_bra @ (pred_fock - real_fock) @ orb_ket
+                reg_loss = torch.norm(wa_error, p="fro")
+            loss = self.lossfn(batch_pred, batch_real) + self.reg_weight * reg_loss
+            # backward propagation
+            self.optimizer.zero_grad()
+            loss.backward()
+            # gradient clipping
+            if self.config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip, error_if_nonfinite=True)
+            self.optimizer.step()
+            # update EMA model
+            if self.ema_model is not None:
+                self.ema_model.update_parameters(self.model)
+            # update learning rate
+            if self.config.lr_scheduler != "plateau":
+                with self.warmup_scheduler.dampening():
+                    self.lr_scheduler.step()
+            # for matrice, record the Frobenious norm distance 
+            with torch.no_grad():
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+            # logging
+            if (self.epoch % self.config.log_epoch == 0 and
+                (step % self.config.log_step == 0 or
+                 step == len(self.train_loader))):
+                mae = self.meter.reduce()
+                self.log.f.info(
+                    "Epoch: [{iepoch:>4}][{step:>4}/{nstep}]   lr: {lr:3e}   train Error: node: {mae_n:10.7f},  edge: {mae_e:10.7f},  total: {mae_tot:10.7f}".format(
+                        iepoch=self.epoch,
+                        step=step,
+                        nstep=len(self.train_loader),
+                        lr=self.optimizer.param_groups[0]["lr"],
+                        mae_n=mae[0],
+                        mae_e=mae[1],
+                        mae_tot=mae[2],
+                    )
+                )
+    
+    def validate(self):
+        self.model.eval()
+        self.meter.reset()
+        with torch.no_grad():
+            for data in self.valid_loader:
+                data = data.to(self.device)
+                res = self.model(data)
+                pred_pad_node, pred_pad_edge = res[0], res[1]
+                real_pad_node = data.node_label - data.node_base if hasattr(data, 'node_base') else data.node_label
+                real_pad_edge = data.edge_label - data.edge_base if hasattr(data, 'edge_base') else data.edge_label
+                batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+        mae = self.meter.reduce()
+        self.log.f.info(f"EMA Validation Error: node: {mae[0]:10.7f}, edge: {mae[1]:10.7f}, total: {mae[2]:10.7f}")
+        total_mae = mae[2]
+        if self.config.lr_scheduler == "plateau":
+            with self.warmup_scheduler.dampening():
+                self.lr_scheduler.step(total_mae)
+            self.early_stop(total_mae, self.best_l2fs[0].loss)
+        self.save_best_k(self.model.module, total_mae)
+        self._save_params(self.model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt") 
+
+    def ema_validate(self):
+        if self.ema_model is None:
+            return
+        self.ema_model.eval()
+        self.meter.reset()
+        with torch.no_grad():
+            for data in self.valid_loader:
+                data = data.to(self.device)
+                res = self.ema_model(data)
+                pred_pad_node, pred_pad_edge = res[0], res[1]
+                real_pad_node = data.node_label - data.node_base if hasattr(data, 'node_base') else data.node_label
+                real_pad_edge = data.edge_label - data.edge_base if hasattr(data, 'edge_base') else data.edge_label
+                batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+        mae = self.meter.reduce()
+        self.log.f.info(f"EMA Validation Error: node: {mae[0]:10.7f}, edge: {mae[1]:10.7f}, total: {mae[2]:10.7f}")
+        total_mae = mae[2]
+        if self.config.lr_scheduler == "plateau":
+            with self.warmup_scheduler.dampening():
+                self.lr_scheduler.step(total_mae)
+            self.early_stop(total_mae, self.best_l2fs[0].loss)
+        self.save_best_k(self.ema_model.module, total_mae)
+        self._save_params(self.ema_model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt")
+
+
+class DIISTrainer(OrbGradTrainer):
+    """
+    Trainer class additionally add DIIS error as a regularization term.
+    """
+    def __init__(
+        self, 
+        model: nn.parallel.DistributedDataParallel, 
+        config: NetConfig,
+        device: torch.device, 
+        train_loader: DataLoader, 
+        valid_loader: DataLoader,
+        dist_sampler: Optional[DistributedSampler], 
+        log: ZeroLogger,
+    ):
+        assert config.ortho_transform == True
+        super().__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
+    
+    def train1epoch(self):
+        self.model.train()
+        self.dist_sampler.set_epoch(self.epoch) 
+        
+        for step, data in enumerate(self.train_loader, start=1):
+            self.meter.reset()
+            data = data.to(self.device) 
+            # forward propagation
+            res = self.model(data)
+            pred_pad_node, pred_pad_edge = res[0], res[1]
+            real_pad_node, real_pad_edge = data.node_label, data.edge_label
+            batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+            pred_node, pred_edge = pred_pad_node[batch_mask_node], pred_pad_edge[batch_mask_edge]
+            real_node, real_edge = real_pad_node[batch_mask_node], real_pad_edge[batch_mask_edge]
+            batch_pred = torch.cat([pred_node, pred_edge], dim=0)
+            batch_real = torch.cat([real_node, real_edge], dim=0)
+            # calculate the regularization term 
+            real_fock = self.mat_builder(real_pad_node, real_pad_edge, data.at_no, data.fc_edge_index)
+            pred_fock = self.mat_builder(pred_pad_node, pred_pad_edge, data.at_no, data.fc_edge_index)
+            ## calculate the density matrix
+            # real_fock = real_fock.cpu().numpy().astype(np.float64)
+            cur_fock = real_fock.detach().cpu().numpy().astype(np.float64)
+            at_no = data.at_no.cpu().numpy()
+            coords = data.pos.cpu().numpy().astype(np.float64)
+            charge = data.charge.to(torch.long).item()
+            ## D = C_occ @ C_occ.T
+            orb_coeffs, nocc, _ = self.orbital_calculator(cur_fock, at_no, coords, charge)
+            cur_den = orb_coeffs[:, :nocc] @ orb_coeffs[:, :nocc].T
+            cur_den = torch.from_numpy(cur_den).to(self._device).to(self._default_dtype)
+            diis_error = cur_den @ pred_fock - pred_fock @ cur_den
+            diis_loss = self.reg_weight * torch.norm(diis_error, p="fro")
+            # calculate the loss
+            loss = self.lossfn(batch_pred, batch_real) + diis_loss
+            # backward propagation
+            self.optimizer.zero_grad()
+            loss.backward()
+            # gradient clipping
+            if self.config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip, error_if_nonfinite=True)
+            self.optimizer.step()
+            # update EMA model
+            if self.ema_model is not None:
+                self.ema_model.update_parameters(self.model)
+            # update learning rate
+            if self.config.lr_scheduler != "plateau":
+                with self.warmup_scheduler.dampening():
+                    self.lr_scheduler.step()
+            # for matrice, record the Frobenious norm distance 
+            with torch.no_grad():
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+            # logging
+            if (self.epoch % self.config.log_epoch == 0 and
+                (step % self.config.log_step == 0 or
+                 step == len(self.train_loader))):
+                mae = self.meter.reduce()
+                self.log.f.info(
+                    "Epoch: [{iepoch:>4}][{step:>4}/{nstep}]   lr: {lr:3e}   train Error: node: {mae_n:10.7f},  edge: {mae_e:10.7f},  total: {mae_tot:10.7f}".format(
+                        iepoch=self.epoch,
+                        step=step,
+                        nstep=len(self.train_loader),
+                        lr=self.optimizer.param_groups[0]["lr"],
+                        mae_n=mae[0],
+                        mae_e=mae[1],
+                        mae_tot=mae[2],
+                    )
+                )
+
+
+class OrbitalTrainer(QCMatTrainer):
+    """
+    Trainer class and template that additionally introduce SCF related regularization terms when training Fock matrices.
+    Here, Wavefunction Alignment loss and Orbital Gradient loss are implemented.
+    """
+    def __init__(
+        self, 
+        model: nn.parallel.DistributedDataParallel, 
+        config: NetConfig,
+        device: torch.device, 
+        train_loader: DataLoader, 
+        valid_loader: DataLoader,
+        dist_sampler: Optional[DistributedSampler], 
+        log: ZeroLogger,
+    ):
+        super(OrbitalTrainer, self).__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
+        self._set_init(config, device)
+    
+    def _set_init(self, config:NetConfig, device:torch.device):
+        # modules for building Fock matrices and calculating orbitals
+        self.mat_builder = QCMatriceBuilder(config.irreps_out, config.possible_elements, config.target_basisname)
+        self.orbital_calculator = OrbitalCalculator(config.target_basisname, config.default_length_unit, config.ortho_transform)
+        self.mat_builder.to(device)
+        # loss regularization parameters
+        self.reg_weight:float = config.reg_weight if config.reg_weight > 0.0 else 1.0
+        # assert config.wa_type in [0, 1, 2], f"Unsupported wavefunction alignment type: {config.wa_type}"
+        self.wa_type:int = config.wa_type 
+        self.num_states:int = config.num_states if config.num_states >= 0 else 1
+        # data type and device
+        self._default_dtype = torch.float64 if config.default_dtype == "float64" else torch.float32 
+        self._device = device
+
+    def _get_reg_term(self, data, real_fock, pred_fock):
+        # calculate the regularization term
+        ## orbital coefficients 
+        real_fock = real_fock.cpu().numpy().astype(np.float64)
+        at_no = data.at_no.cpu().numpy()
+        coords = data.pos.cpu().numpy().astype(np.float64)
+        charge = data.charge.to(torch.long).item()
+        orb_coeffs, nocc, nvirt = self.orbital_calculator(real_fock, at_no, coords, charge)
+        real_fock = torch.from_numpy(real_fock).to(self._device).to(self._default_dtype)
+        ## type 0 and type 1 (num_states = 1) are WALoss from Liu et.al. ICLR 2025
+        if self.wa_type == 0:
+            orb_space = torch.from_numpy(orb_coeffs).to(self._device).to(self._default_dtype)
+            wa_error = orb_space.T @ (pred_fock - real_fock) @ orb_space
+            reg_loss = self.reg_weight * torch.norm(wa_error, p="fro")
+        elif self.wa_type == 1:
+            # wavefunction alignment loss
+            num_states = min(self.num_states, nvirt)
+            ## assume the valence (active) space is num_occ + num_states (the first n virtual orbital)
+            orb_space_val = torch.from_numpy(orb_coeffs[:, :nocc+num_states]).to(self._device).to(self._default_dtype)
+            wa_error = orb_space_val.T @ (pred_fock - real_fock) @ orb_space_val
+            wa_loss_I = self.reg_weight * torch.norm(wa_error, p="fro")
+            if self.num_states < nvirt:
+                orb_space_virt = torch.from_numpy(orb_coeffs[:, nocc+num_states:]).to(self._device).to(self._default_dtype)
+                orb_error_virt = orb_space_virt.T @ (pred_fock - real_fock) @ orb_space_virt
+                # according to Liu et.al. ICLR 2025, this factor should be much smaller, but has no suggestion value
+                wa_loss_II = self.reg_weight * 0.1 * torch.norm(orb_error_virt, p="fro") 
+                reg_loss = wa_loss_I + wa_loss_II
+            else:
+                reg_loss = wa_loss_I 
+        elif self.wa_type == 2:
+            # modified from WALoss, add orbital gradient loss 
+            orb_space_occ = torch.from_numpy(orb_coeffs[:, :nocc]).to(self._device).to(self._default_dtype)
+            orb_space_virt = torch.from_numpy(orb_coeffs[:, nocc:]).to(self._device).to(self._default_dtype)
+            ## waloss term for eigen space
+            wa_error_occ = orb_space_occ.T @ (pred_fock - real_fock) @ orb_space_occ
+            wa_error_virt = orb_space_virt.T @ (pred_fock - real_fock) @ orb_space_virt
+            wa_loss = torch.norm(wa_error_occ, p="fro") + torch.norm(wa_error_virt, p="fro")
+            ## orbital gradient term for off-diagonal space, analytically, this should be scaled by 2.0, but it is not necessary as we have a weight factor
+            orb_grad = orb_space_virt.T @ (pred_fock - real_fock) @ orb_space_occ
+            orb_grad_loss = self.reg_weight * torch.norm(orb_grad, p="fro") 
+            reg_loss = wa_loss + orb_grad_loss
+        else:
+            raise ValueError(f"Unsupported wavefunction alignment type: {self.wa_type}")
+        return reg_loss
+    
+    def train1epoch(self):
+        self.model.train()
+        self.dist_sampler.set_epoch(self.epoch) 
+        
+        for step, data in enumerate(self.train_loader, start=1):
+            self.meter.reset()
+            data = data.to(self.device) 
+            # forward propagation
+            res = self.model(data)
+            pred_pad_node, pred_pad_edge = res[0], res[1]
+            real_pad_node, real_pad_edge = data.node_label, data.edge_label
+            batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+            if hasattr(data, 'node_base'):
+                pred_pad_node = pred_pad_node + data.node_base
+            if hasattr(data, 'edge_base'):
+                pred_pad_edge = pred_pad_edge + data.edge_base
+            pred_node, pred_edge = pred_pad_node[batch_mask_node], pred_pad_edge[batch_mask_edge]
+            real_node, real_edge = real_pad_node[batch_mask_node], real_pad_edge[batch_mask_edge]
+            batch_pred = torch.cat([pred_node, pred_edge], dim=0)
+            batch_real = torch.cat([real_node, real_edge], dim=0)
+            # calculate the loss 
+            orig_loss = self.lossfn(batch_pred, batch_real)
+            ## regularization term
+            real_fock = self.mat_builder(real_pad_node, real_pad_edge, data.at_no, data.fc_edge_index)
+            pred_fock = self.mat_builder(pred_pad_node, pred_pad_edge, data.at_no, data.fc_edge_index)
+            reg_loss = self._get_reg_term(data, real_fock, pred_fock)
+            ## total loss
+            loss = orig_loss + reg_loss 
+            # backward propagation
+            self.optimizer.zero_grad()
+            loss.backward()
+            # gradient clipping
+            if self.config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip, error_if_nonfinite=True)
+            self.optimizer.step()
+            # update EMA model
+            if self.ema_model is not None:
+                self.ema_model.update_parameters(self.model)
+            # update learning rate
+            if self.config.lr_scheduler != "plateau":
+                with self.warmup_scheduler.dampening():
+                    self.lr_scheduler.step()
+            # for matrice, record the Frobenious norm distance 
+            with torch.no_grad():
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+            # logging
+            if (self.epoch % self.config.log_epoch == 0 and
+                (step % self.config.log_step == 0 or
+                 step == len(self.train_loader))):
+                mae = self.meter.reduce()
+                self.log.f.info(
+                    "Epoch: [{iepoch:>4}][{step:>4}/{nstep}]   lr: {lr:3e}   train Error: node: {mae_n:10.7f},  edge: {mae_e:10.7f},  total: {mae_tot:10.7f}".format(
+                        iepoch=self.epoch,
+                        step=step,
+                        nstep=len(self.train_loader),
+                        lr=self.optimizer.param_groups[0]["lr"],
+                        mae_n=mae[0],
+                        mae_e=mae[1],
+                        mae_tot=mae[2],
+                    )
+                )
+    
+    def validate(self):
+        self.model.eval()
+        self.meter.reset()
+        with torch.no_grad():
+            for data in self.valid_loader:
+                data = data.to(self.device)
+                res = self.model(data)
+                pred_pad_node, pred_pad_edge = res[0], res[1]
+                real_pad_node = data.node_label - data.node_base if hasattr(data, 'node_base') else data.node_label
+                real_pad_edge = data.edge_label - data.edge_base if hasattr(data, 'edge_base') else data.edge_label
+                batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+        mae = self.meter.reduce()
+        self.log.f.info(f"EMA Validation Error: node: {mae[0]:10.7f}, edge: {mae[1]:10.7f}, total: {mae[2]:10.7f}")
+        total_mae = mae[2]
+        if self.config.lr_scheduler == "plateau":
+            with self.warmup_scheduler.dampening():
+                self.lr_scheduler.step(total_mae)
+            self.early_stop(total_mae, self.best_l2fs[0].loss)
+        self.save_best_k(self.model.module, total_mae)
+        self._save_params(self.model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt") 
+
+    def ema_validate(self):
+        if self.ema_model is None:
+            return
+        self.ema_model.eval()
+        self.meter.reset()
+        with torch.no_grad():
+            for data in self.valid_loader:
+                data = data.to(self.device)
+                res = self.ema_model(data)
+                pred_pad_node, pred_pad_edge = res[0], res[1]
+                real_pad_node = data.node_label - data.node_base if hasattr(data, 'node_base') else data.node_label
+                real_pad_edge = data.edge_label - data.edge_base if hasattr(data, 'edge_base') else data.edge_label
+                batch_mask_node, batch_mask_edge = data.onsite_mask, data.offsite_mask
+                node_diff = (pred_pad_node - real_pad_node) * batch_mask_node
+                edge_diff = (pred_pad_edge - real_pad_edge) * batch_mask_edge
+                node_l2norm = torch.norm(node_diff, p="fro", dim=[1, 2]).sum()
+                edge_l2norm = torch.norm(edge_diff, p="fro", dim=[1, 2]).sum()
+                total_l2norm = node_l2norm + edge_l2norm
+                num_node, num_edge = real_pad_node.shape[0], real_pad_edge.shape[0]
+                self.meter.update(node_l2norm.item(), edge_l2norm.item(), total_l2norm.item(), num_node, num_edge, num_node + num_edge)
+        mae = self.meter.reduce()
+        self.log.f.info(f"EMA Validation Error: node: {mae[0]:10.7f}, edge: {mae[1]:10.7f}, total: {mae[2]:10.7f}")
+        total_mae = mae[2]
+        if self.config.lr_scheduler == "plateau":
+            with self.warmup_scheduler.dampening():
+                self.lr_scheduler.step(total_mae)
+            self.early_stop(total_mae, self.best_l2fs[0].loss)
+        self.save_best_k(self.ema_model.module, total_mae)
+        self._save_params(self.ema_model.module, f"{self.config.save_dir}/{self.config.run_name}_last.pt")
+
+
+class WavefunctionTrainer(OrbitalTrainer):
+    def __init__(
+        self, 
+        model: nn.parallel.DistributedDataParallel, 
+        config: NetConfig,
+        device: torch.device, 
+        train_loader: DataLoader, 
+        valid_loader: DataLoader,
+        dist_sampler: Optional[DistributedSampler], 
+        log: ZeroLogger,
+    ):
+        super(WavefunctionTrainer, self).__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
+    
+    def _get_reg_term(self, data, real_fock, pred_fock):
+        real_fock = real_fock.cpu().numpy().astype(np.float64)
+        at_no = data.at_no.cpu().numpy()
+        coords = data.pos.cpu().numpy().astype(np.float64)
+        charge = data.charge.to(torch.long).item()
+        orb_coeffs, nocc, nvirt = self.orbital_calculator(real_fock, at_no, coords, charge)
+        real_fock = torch.from_numpy(real_fock).to(self._device).to(self._default_dtype) 
+        ## DIIS loss 
+        cur_den = orb_coeffs[:, :nocc] @ orb_coeffs[:, :nocc].T
+        cur_den = torch.from_numpy(cur_den).to(self._device).to(self._default_dtype)
+        diis_error = cur_den @ pred_fock - pred_fock @ cur_den
+        diis_loss = torch.norm(diis_error, p="fro")
+        if self.wa_type == 0:
+            ## Wavefunction Alignment loss for the eigen space 
+            orb_space = torch.from_numpy(orb_coeffs).to(self._device).to(self._default_dtype)
+            wa_error = orb_space.T @ (pred_fock - real_fock) @ orb_space
+            wa_loss = torch.norm(wa_error, p="fro")
+        elif self.wa_type == 1:
+            ## Wavefunction Alignment loss for the occupied space and virtual space separately
+            orb_occ = torch.from_numpy(orb_coeffs[:, :nocc]).to(self._device).to(self._default_dtype)
+            orb_virt = torch.from_numpy(orb_coeffs[:, nocc:]).to(self._device).to(self._default_dtype)
+            wa_error_occ = orb_occ.T @ (pred_fock - real_fock) @ orb_occ
+            wa_loss_occ = torch.norm(wa_error_occ, p="fro")
+            wa_error_virt = orb_virt.T @ (pred_fock - real_fock) @ orb_virt
+            wa_loss_virt = torch.norm(wa_error_virt, p="fro")
+            wa_loss = wa_loss_occ + wa_loss_virt
+        elif self.wa_type == 2:
+            # WALoss for full occupied space only 
+            orb_occ = torch.from_numpy(orb_coeffs[:, :nocc]).to(self._device).to(self._default_dtype)
+            wa_error_occ = orb_occ.T @ (pred_fock - real_fock) @ orb_occ
+            wa_loss = torch.norm(wa_error_occ, p="fro")
+        else:
+            raise ValueError(f"Unsupported wavefunction alignment type: {self.wa_type}")
+        # total loss
+        reg_loss = self.reg_weight * diis_loss + wa_loss
+        return reg_loss
+

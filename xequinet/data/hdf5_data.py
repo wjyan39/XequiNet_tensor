@@ -25,7 +25,7 @@ def set_init_attr(dataset: Dataset, config: NetConfig, **kwargs):
     dataset._mode = kwargs.get("mode", "train")
     assert dataset._mode in ["train", "valid", "test"]
     dataset._pbc = True if "pbc" in config.version else False
-    # dataset._triplet = True if "xpainn2" in config.version else False
+    dataset._mat = True if "mat" in config.version else False
     dataset._cutoff = config.cutoff
     dataset._max_edges = config.max_edges
     dataset._mem_process = config.mem_process
@@ -41,6 +41,17 @@ def set_init_attr(dataset: Dataset, config: NetConfig, **kwargs):
             dataset._prop_dict['base_force'] = config.bforce_name
     if config.label_mask is not None:
         dataset._prop_dict["label_mask"] = config.label_mask
+    # Edge attributes for X2 graph representation.
+    if config.edge_attr is not None:
+        dataset._prop_dict["edge_attr"] = config.edge_attr
+
+    if dataset._mat:
+        dataset._prop_dict["target_irreps"] = config.irreps_out             # target basis layout in the padding format
+        dataset._prop_dict["possible_elements"] = config.possible_elements  # possible elements list 
+        dataset._prop_dict["basisname"] = config.target_basisname           # target basis set 
+        dataset._prop_dict["map_type"] = config.m_idx_map_type              # layout format of the (2l+1)-degenerate orbitals from -l to +l
+        dataset._prop_dict["full_edge_index"] = config.full_edge_index      # whether the complete graph should be generated 
+        dataset._prop_dict["ortho_transform"] = config.ortho_transform      # whether the target Fock matrix is orthogonalized
     
     # virtual dimension is for batch collation
     # e.g. shape of dipole moment is (3,) for a single molecule
@@ -51,6 +62,8 @@ def set_init_attr(dataset: Dataset, config: NetConfig, **kwargs):
     
     if dataset._pbc:
         dataset._process_h5 = process_pbch5
+    elif dataset._mat:
+        dataset._process_h5 = process_math5
     else:
         dataset._process_h5 = process_h5
 
@@ -165,6 +178,69 @@ def process_pbch5(f_h5: h5py.File, mode: str, cutoff: float, prop_dict: dict, **
                 if "mask" in p_attr:
                     p_val = p_val.bool()
                 setattr(data, p_attr, p_val)
+            yield data
+
+
+def process_math5(f_h5: h5py.File, mode: str, cutoff: float, prop_dict: dict, **kwargs):
+    """
+    process the hdf5 file of matirx data
+    """
+    from ..utils import Mat2GraphLabel, TwoBodyBlockMask 
+    len_unit = get_default_unit()[1]
+    max_edges = kwargs.get("max_edges", 100)
+    mat2graph = Mat2GraphLabel(prop_dict["target_irreps"], prop_dict["possible_elements"], prop_dict["basisname"], prop_dict["map_type"])
+    genmask = TwoBodyBlockMask(prop_dict["target_irreps"], prop_dict["possible_elements"], prop_dict["basisname"])
+    full_edge_index: bool = prop_dict["full_edge_index"] 
+    has_base: bool = "base_y" in prop_dict.keys()
+    has_edge_attr: bool = "edge_attr" in prop_dict.keys()
+    # loop over samples
+    for mol_name in f_h5[mode].keys():
+        mol_grp = f_h5[mode][mol_name]
+        at_no = torch.LongTensor(mol_grp["atomic_numbers"][()])
+        if "coordinates_A" in mol_grp.keys():
+            coords = torch.Tensor(mol_grp["coordinates_A"][()]).to(torch.get_default_dtype())
+            coords *= unit_conversion("Angstrom", len_unit)
+        elif "coordinates_bohr" in mol_grp.keys():
+            coords = torch.Tensor(mol_grp["coordinates_bohr"][()]).to(torch.get_default_dtype())
+            coords *= unit_conversion("Bohr", len_unit)
+        else:
+            raise ValueError("Coordinates not found in the hdf5 file.")
+        charge = float(mol_grp["charge"][()]) if "charge" in mol_grp.keys() else 0.0
+        spin = float(mol_grp["multiplicity"][()] - 1) if "multiplicity" in mol_grp.keys() else 0.0
+        charge = torch.Tensor([charge]).to(torch.get_default_dtype())
+        spin = torch.Tensor([spin]).to(torch.get_default_dtype())
+        for icfm, coord in enumerate(coords):
+            edge_index = radius_graph(coord, r=cutoff, max_num_neighbors=max_edges)
+            data = Data(at_no=at_no, pos=coord, edge_index=edge_index, charge=charge, spin=spin)
+            matrice_y = torch.from_numpy(
+                mol_grp[prop_dict['y']][()][icfm].copy()
+            ).to(torch.get_default_dtype())
+            # Delta-learning 
+            if has_base:
+                matrice_base = torch.from_numpy(
+                    mol_grp[prop_dict['base_y']][()][icfm].copy()
+                ).to(torch.get_default_dtype())
+            # generate the labels and masks
+            label_edge_index = edge_index if full_edge_index else None
+            mole_node_label, mole_edge_label = mat2graph(data, matrice_y, at_no, label_edge_index)
+            mask_edge_index = edge_index if full_edge_index else data.fc_edge_index 
+            mole_node_mask, mole_edge_mask = genmask(at_no, mask_edge_index)
+            data.node_label = mole_node_label.to(torch.get_default_dtype())
+            data.edge_label = mole_edge_label.to(torch.get_default_dtype())
+            data.onsite_mask = mole_node_mask
+            data.offsite_mask = mole_edge_mask
+            # X2 graph representation
+            if has_edge_attr:
+                matrice_edge_attr = torch.from_numpy(
+                    mol_grp[prop_dict['edge_attr']][()][icfm].copy()
+                ).to(torch.get_default_dtype())
+                _, mole_edge_attr = mat2graph(data, matrice_edge_attr, at_no, mask_edge_index)
+                data.fc_edge_attr = mole_edge_attr.to(torch.get_default_dtype())
+            # Delta-learning
+            if has_base:
+                mole_node_base, mole_edge_base = mat2graph(data, matrice_base, at_no, label_edge_index)
+                data.node_base = mole_node_base.to(torch.get_default_dtype())
+                data.edge_base = mole_edge_base.to(torch.get_default_dtype())
             yield data
 
 
@@ -421,6 +497,23 @@ def data_unit_transform(
     return new_data
 
 
+def mat_data_unit_transform(data: Data, label_unit: Optional[str] = None) -> Data:
+    """
+    Create a deep copy of the data and transform the units of the copy.
+    """
+    new_data = data.clone()
+    prop_unit, _ = get_default_unit()
+    if hasattr(new_data, "node_label"):
+        new_data.node_label *= unit_conversion(label_unit, prop_unit)
+    if hasattr(new_data, "edge_label"):
+        new_data.edge_label *= unit_conversion(label_unit, prop_unit)
+    if hasattr(new_data, "node_base"):
+        new_data.node_base *= unit_conversion(label_unit, prop_unit)
+    if hasattr(new_data, "edge_base"):
+        new_data.edge_base *= unit_conversion(label_unit, prop_unit)
+    return new_data
+
+
 def atom_ref_transform(
     data: Data,
     atom_sp: torch.Tensor,
@@ -452,17 +545,23 @@ def atom_ref_transform(
 def create_dataset(config: NetConfig, mode: str = "train", local_rank: int = None):
     with distributed_zero_first(local_rank):
         # set transform function
-        pre_transform = lambda data: data_unit_transform(
-            data=data, y_unit=config.label_unit, by_unit=config.blabel_unit,
-            force_unit=config.force_unit, bforce_unit=config.bforce_unit,
-        )
-        atom_sp = get_atomic_energy(config.atom_ref)
-        batom_sp = get_atomic_energy(config.batom_ref)
-        transform = lambda data: atom_ref_transform(
-            data=data,
-            atom_sp=atom_sp,
-            batom_sp=batom_sp,
-        )
+        if "mat" in config.version:
+            pre_transform = lambda data: mat_data_unit_transform(
+                data=data, label_unit=config.label_unit,
+            )
+            transform = None
+        else:
+            pre_transform = lambda data: data_unit_transform(
+                data=data, y_unit=config.label_unit, by_unit=config.blabel_unit,
+                force_unit=config.force_unit, bforce_unit=config.bforce_unit,
+            )
+            atom_sp = get_atomic_energy(config.atom_ref)
+            batom_sp = get_atomic_energy(config.batom_ref)
+            transform = lambda data: atom_ref_transform(
+                data=data,
+                atom_sp=atom_sp,
+                batom_sp=batom_sp,
+            )
         if config.dataset_type == "normal":
             dataset = H5Dataset(config, mode=mode, pre_transform=pre_transform, transform=transform)
         elif config.dataset_type == "memory":

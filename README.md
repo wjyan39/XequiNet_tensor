@@ -1,6 +1,7 @@
 ## XequiNet
 XequiNet is a package implemented for property prediction of chemical molecules or periodical systems with equivariant graph neural network.
-This repository is the light branch for tensorial properties. (wjyan 2024.05) 
+This repository is the light branch for tensorial properties. (wjyan 2024.05)
+For training models for Kohn-Sham Hamiltonian, switch to the hamiltonian branch. (wjyan 2026.08) 
 
 For the original repository, see <https://github.com/X1X1010/XequiNet.git>.
 

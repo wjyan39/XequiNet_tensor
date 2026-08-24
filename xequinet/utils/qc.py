@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional, Union, Tuple
 from math import pi
 import warnings
 import re
@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pyscf import gto
 import numpy as np
+from scipy.linalg import eigh, sqrtm, inv 
 import torch
 
 
@@ -324,6 +325,43 @@ def get_l_from_basis(basisname, ele):
         bf = basisname
     basis = gto.basis.load(bf, ele)
     return [b[0] for b in basis]
+
+
+def cal_orbital_and_energies(overlap_matrix: torch.Tensor, full_hamiltonian: torch.Tensor, transform_type: int=1) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Args:
+        overlap_matrix: (nbasis, nbasis)
+        full_hamiltonian: (nbasis, nbasis)
+        transform_type: 0 for orthogonalized, 1 for generalized eigenvalue problem
+    Returns:
+        orbital_energies: (norb,)
+        orbital_coefficients: (nbasis, norb)
+        overlap_half: (nbasis, nbasis)
+    """
+    assert overlap_matrix.shape[0] == full_hamiltonian.shape[0]
+    device = full_hamiltonian.device
+    dtype = full_hamiltonian.dtype
+    overlap = overlap_matrix.cpu().numpy()
+    fock = full_hamiltonian.cpu().numpy()
+    overlap_half_inv = inv(sqrtm(overlap))
+    overlap_half = sqrtm(overlap)
+    if transform_type == 1:
+        e, c = eigh(fock, overlap) 
+    elif transform_type == 0:
+        # fock = overlap_half @ fock @ overlap_half
+        e, c_prime = eigh(fock, driver="evx")
+        c = overlap_half_inv @ c_prime
+        # c = np.matmul(overlap_half_inv, c_prime)
+    else:
+        raise ValueError("transform_type should be 0 or 1")
+    # standardize the phase
+    idx = np.argmax(abs(c.real), axis=0)
+    c[:,c[idx,np.arange(len(e))].real<0] *= -1
+    # convert to torch tensor
+    orbital_energies = torch.from_numpy(e).to(device=device, dtype=dtype)
+    orbital_coefficients = torch.from_numpy(c).to(device=device, dtype=dtype)
+    overlap_half = torch.from_numpy(overlap_half).to(device=device, dtype=dtype)
+    return orbital_energies, orbital_coefficients, overlap_half
 
 
 if __name__ == "__main__":

@@ -11,12 +11,15 @@ class NetConfig(BaseModel):
 
     # configurations about the model
     version: str = "xpainn"                        # model version
+    pbc: bool = False                              # whether to apply periodic boundary conditions
     embed_basis: str = "gfn2-xtb"                  # embedding basis type
     aux_basis: str = "aux56"                       # auxiliary basis type
     node_dim: int = 128                            # node irreps for the input
     edge_irreps: str = "128x0e + 64x1o + 32x2e"    # edge irreps for the input
     hidden_dim: int = 64                           # hidden dimension for the output
     hidden_irreps: str = "64x0e + 32x1o + 16x2e"   # hidden irreps for the output
+    irreps_dim: int = 64                           # irreps dimension of hidden feature 
+    max_l: int = 4                                 # maximum angular momentum required in network
     rbf_kernel: str = "bessel"                     # radial basis function type
     num_basis: int = 20                            # number of the radial basis functions
     cutoff: float = 5.0                            # cutoff distance for the neighbor atoms
@@ -34,16 +37,21 @@ class NetConfig(BaseModel):
     default_length_unit: str = "Angstrom"          # unit of the input coordinates
     default_property_unit: str = "eV"              # unit of the input properties
     default_dtype: str = "float32"                 # default data type
-    # additional configurations for n-order tensor output 
+    ## additional configurations for n-order tensor output 
     order: int = 2                                 # rank of output tensor
     required_symm: str = "ij"                      # indices symmetry of the tensor, "ij" for arbitary rank-2 tensor etc.
     vector_space: Optional[dict] = None            # vector space for the output tensor
-    target_elem: Optional[Union[List[str], List[int]]] = None  # for element-wise training of atomic shielding constant 
-    mat_hidden_dim: int = 64                       # hidden dimension of each irrep feature in network
-    max_l: int = 4                                 # maximum angular momentum required in network
-    irreps_out: Optional[str] = None               # output layout required by user
     node_slope: Optional[Union[float, dict]] = None  # slope for each node type if using `shift` mode
     node_ref: Optional[Union[str, dict]] = None      # atomic reference (only for `shift` mode)
+    ## additional configurations for matrice output 
+    mat_hidden_dim: int = 64                       # hidden dimension of each irrep feature in network
+    mat_block_dim: int = 32                        # dimension of each irrep feature in output
+    pair_rbf_kernel:str = "bessel"                 # radial basis function type in pair output 
+    pair_num_basis: int = 20                       # number of the radial basis functions
+    pair_cutoff: float = 1000.0                    # cutoff distance for the pair atoms in complete graph
+    num_mat_conv: int = 2                          # number of convolution blocks applied in matrice network where num_action_block stands for number of read-out modules
+    symmetrize: bool = True                        # whether to skip symmetrize Fock matrix 
+    irreps_out: Optional[str] = None               # output layout required by user, for matrice learning it corresponds to target basis set layout.
 
     # configurations about the dataset
     dataset_type: str = "normal"                   # dataset type (`memory` is for the dataset in memory, `disk` is for the dataset on disk)
@@ -56,12 +64,22 @@ class NetConfig(BaseModel):
     force_name: Optional[str] = None               # name of the force
     bforce_name: Optional[str] = None              # name of the basis force
     label_mask: Optional[str] = None               # name of the label mask
+    edge_attr:  Optional[str] = None               # name of the edge attribute input 
     label_unit: Optional[str] = None               # unit of the input label
     blabel_unit: Optional[str] = None              # unit of the input base label
     force_unit: Optional[str] = None               # unit of the input force
     bforce_unit: Optional[str] = None              # unit of the input base force
     batch_size: int = 64                           # training batch size
     vbatch_size: int = 64                          # validation batch size
+    ## additional configurations for data processing and training for certain properties 
+    target_elem: Optional[Union[List[str], List[int]]] = None       # for element-wise training of atomic tensors 
+    possible_elements: Optional[List[str]] = ["H", "C", "N", "O"]
+    target_basisname: str = "def2-svp"                              # name of the basis set used for calculating label QC matrices
+    m_idx_map_type: str = "pyscf"                                   # how to map the atomic orbital index into network default ordering according to e3nn
+    full_edge_index: bool = False                                   # whether to build sparse matrice output correspond to distance-cutoff edges
+    ortho_transform: bool = False                                   # whether the target Fock matrix is orthogonalized by S^-1/2
+    wa_type: int = 0                                                # type of regularization term for training Fock matrix, currently supports type 0, 1 and 2
+    num_states: int = 5                                             # for wavefunction trainer, specifying the number of low-lying states to be included in the eigen space
 
     # configurations about the training
     ckpt_file: Optional[str] = None                # checkpoint file to load
@@ -95,13 +113,21 @@ class NetConfig(BaseModel):
 
     def model_hyper_params(self):
         hyper_params = self.model_dump(include={
-            "version", "embed_basis", "aux_basis", "node_dim", "edge_irreps", "hidden_dim", "hidden_irreps",
-            "rbf_kernel", "num_basis", "cutoff", "cutoff_fn", "max_edges", "action_blocks",
-            "activation", "norm_type", "output_mode", "output_dim", "order", "required_symm", 
-            "max_l", "mat_hidden_dim",
-            "atom_ref", "batom_ref", "node_average", "default_property_unit", "default_length_unit",
-            "default_dtype",
+            "version", "embed_basis", "aux_basis", "node_dim", "edge_irreps", "hidden_dim", "hidden_irreps", 
+            "max_l", "irreps_dim", "action_blocks",  
+            "rbf_kernel", "num_basis", "cutoff", "cutoff_fn", "max_edges", 
+            "activation", "norm_type", "output_mode", "output_dim", "order", "required_symm",
+            "atom_ref", "batom_ref", "node_average", "default_property_unit", "default_length_unit", "default_dtype",
         })
+        if "mat" in self.version:
+            hyper_params.update(self.model_dump(include={
+                "irreps_out", "mat_hidden_dim", "mat_block_dim", "num_mat_conv", 
+                "pair_rbf_kernel", "pair_num_basis", "pair_cutoff",
+                "target_basisname", "possible_elements", "full_edge_index", "m_idx_map_type", "ortho_transform"
+            }))
+            del hyper_params["output_mode"]; del hyper_params["output_dim"]
+            del hyper_params["order"]; del hyper_params["required_symm"]
+            del hyper_params["atom_ref"]; del hyper_params["batom_ref"]; del hyper_params["node_average"]
         return hyper_params
 
 

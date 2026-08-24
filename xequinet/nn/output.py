@@ -1169,7 +1169,7 @@ def resolve_output(config: NetConfig):
             node_dim=config.node_dim,
             edge_irreps=config.edge_irreps,
             hidden_dim=config.hidden_dim,
-            hidden_irrep_dim=config.mat_hidden_dim,
+            hidden_irrep_dim=config.irreps_dim,
             order=config.order,
             max_l=config.max_l,
             required_symmetry=config.required_symm,
