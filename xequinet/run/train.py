@@ -130,7 +130,15 @@ def main():
     if config.output_mode == "grad":
         from xequinet.utils import GradTrainer as MyTrainer
     elif config.output_mode in ["chemical_shielding", "chemical_shifts"]:
-        from xequinet.utils import CSCTrainer as MyTrainer 
+        from xequinet.utils import CSCTrainer as MyTrainer
+    elif config.output_mode == "matrice":
+        from xequinet.utils import QCMatTrainer as MyTrainer
+    elif config.output_mode == "orbital":
+        from xequinet.utils import OrbitalTrainer as MyTrainer
+    elif config.output_mode == "wavefunction":
+        from xequinet.utils import WavefunctionTrainer as MyTrainer
+    elif config.output_mode == "orbital_grad":
+        from xequinet.utils import DIISTrainer as MyTrainer 
     else:
         from xequinet.utils import Trainer as MyTrainer
     trainer = MyTrainer(ddp_model, config, device, train_loader, valid_loader, train_sampler, log)
