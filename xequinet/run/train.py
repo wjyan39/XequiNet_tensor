@@ -118,9 +118,13 @@ def main():
     # record the number of parameters
     n_params = 0
     for name, param in ddp_model.named_parameters():
-        if config.finetune and "embed.node_lin" not in name:
-            param.requires_grad = False
-            log.s.info(f"{name}: {param.numel()} (frozen)")
+        if config.finetune:
+            if any([named_module in name for named_module in config.finetune_list]):
+                n_params += param.numel()
+                log.s.info(f"{name}: {param.numel()}")
+            else:
+                param.requires_grad = False
+                log.s.info(f"{name}: {param.numel()} (frozen)")
         else:
             n_params += param.numel()
             log.s.info(f"{name}: {param.numel()}")

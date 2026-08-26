@@ -1,7 +1,5 @@
 ## XequiNet
 XequiNet is a package implemented for property prediction of chemical molecules or periodical systems with equivariant graph neural network.
-This repository is the light branch for tensorial properties. (wjyan 2024.05)
-For training models for Kohn-Sham Hamiltonian, switch to the hamiltonian branch. (wjyan 2026.08) 
 
 For the original repository, see <https://github.com/X1X1010/XequiNet.git>.
 
@@ -19,7 +17,34 @@ pydantic 2.6<br>
 ase 3.22<br>
 pyscf 2.4
 
-## Extra requirements
+## Installation of dependencies
+### For GLIBC <= 2.27
+```
+conda create -n <env_name> python=3.9 numpy=1.26 scipy h5py 
+source activate <env_name>
+conda install pytorch=2.0.1 pytorch-cuda==11.7 -c pytorch -c nvidia
+conda install pyg=2.3 -c pyg 
+pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.0.1+cu117.html
+pip install pydantic==2.6
+pip install tqdm pyscf==2.4 e3nn==0.5.1 pytorch-warmup
+pip install ase==3.22
+conda deactivate
+```
+
+### For latest version of packages
+```
+conda create -n <env_name> python=3.11 numpy scipy h5py -c conda-forge
+source activate <env_name>
+pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.11.0+cu126.html
+pip install pydantic==2.6
+pip install tqdm pyscf e3nn pytorch-warmup
+pip install ase
+conda deactivate
+```
+
+### Extra requirements
 
 **The geomeTRIC package is used for geometry optimization.**
 
@@ -30,6 +55,9 @@ geometric 1.0
 tblite 0.3<br>
 tblite-python 0.3
 
+**MOKIT is used for transforming wavefunction files from model predicted KS Hamiltonian.**
+
+mokit `conda install -c conda-forge -c mokit mokit`
 
 ## Setups
 ### From Source

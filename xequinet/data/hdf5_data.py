@@ -333,7 +333,7 @@ class H5MemDataset(InMemoryDataset):
         self._processed_file = f"{self._data_name}_{self._mode}.pt"        
         
         super().__init__(root, transform=self.transform, pre_transform=self.pre_transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
     
     @property
     def raw_file_names(self) -> Iterable[str]:
@@ -468,7 +468,7 @@ class H5DiskDataset(DiskDataset):
             self._processed_folder,
             f"{idx // 10000:04d}",
             f"{idx:08d}.pt"
-        ))
+        ), weights_only=False)
         return data
 
 

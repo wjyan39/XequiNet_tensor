@@ -85,6 +85,7 @@ class NetConfig(BaseModel):
     ckpt_file: Optional[str] = None                # checkpoint file to load
     resume: bool = False                           # whether to resume the training
     finetune: bool = False                         # whether to finetune the model
+    finetune_list: List[str] = ["out",]            # list of layers to be finetuned
     warmup_scheduler: str = "linear"               # warmup scheduler type
     warmup_epochs: int = 10                        # number of the warmup epochs
     max_epochs: int = 300                          # maximum number of the training epochs
@@ -99,6 +100,7 @@ class NetConfig(BaseModel):
     lr_sche_kwargs: dict = {}                      # kwargs for the learning rate scheduler
     early_stop: Optional[int] = None               # number of the epochs to wait before stopping the training
     ema_decay: Optional[float] = None              # exponential moving average decay
+    reg_weigtht: float = 1.0                       # weight of the regularization term for certain tasks
 
     # configurations about the logging
     save_dir: str = './'                           # directory to save the model
