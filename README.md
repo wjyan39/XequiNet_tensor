@@ -39,7 +39,7 @@ pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu126
 pip install torch_geometric
 pip install pyg_lib torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.11.0+cu126.html
 pip install pydantic==2.6
-pip install tqdm pyscf e3nn pytorch-warmup
+pip install tqdm pyscf e3nn==0.5.1 pytorch-warmup
 pip install ase
 conda deactivate
 ```
@@ -74,3 +74,5 @@ See the markdown files in `docs` for details.
 `docs/inference.md`: Prediction with a trained model `xxx.pt`.
 
 `docs/geometry.md`: Geometry optimization and molecular dynamics with a **JIT** model `xxx.jit`.
+
+`docs/hamiltonian.md`: Workflow for training and inference of Kohn-Sham Hamiltonian model.
