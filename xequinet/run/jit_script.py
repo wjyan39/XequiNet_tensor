@@ -43,6 +43,12 @@ def main():
     # set default unit
     set_default_unit(config.default_property_unit, config.default_length_unit)
 
+    # set default dtype
+    if config.default_dtype == "float32":
+        torch.set_default_dtype(torch.float32)
+    elif config.default_dtype == "float64":
+        torch.set_default_dtype(torch.float64)
+
     # build model
     if args.md:
         # result contains "energy", atomic "energies", "forces", "virial" and atomic "virials"

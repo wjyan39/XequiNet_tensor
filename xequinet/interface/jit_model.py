@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import math
 
 import torch
@@ -6,7 +6,19 @@ import torch.nn as nn
 from torch_cluster import radius_graph
 
 from ..nn import resolve_actfn
-from ..nn.xpainn import XEmbedding, XPainnMessage, XPainnUpdate
+from ..nn.xpainn import XPainnMessage, XPainnUpdate
+from ..nn.xpainnorb import FullEdgeKernel, FullEdgeSPH
+from .jit_blocks import (
+    JitBlockNorm2d,
+    JitBuildMatPerMole,
+    JitMat2GraphLabel,
+    JitMatriceOut,
+    JitTwoBodyBlockMask,
+    JitXEmbedding,
+    JitXMatTrans,
+    JitZMatTrans,
+    JitZMatriceOut,
+)
 from ..utils import NetConfig, unit_conversion, get_default_unit, get_atomic_energy
 
 
@@ -66,7 +78,7 @@ class JitPaiNN(nn.Module):
     """
     def __init__(self, config: NetConfig):
         super().__init__()
-        self.embed = XEmbedding(
+        self.embed = JitXEmbedding(
             node_dim=config.node_dim,
             edge_irreps=config.edge_irreps,
             embed_basis=config.embed_basis,
@@ -205,11 +217,286 @@ class JitPaiNNEle(JitPaiNN):
         return result
 
 
+class JitXPaiNNOrb(nn.Module):
+    """
+    XPaiNN-Orb model for JIT script, assembling the full Hamiltonian matrix
+    for a single molecule. This model does not consider batch nor PBC.
+
+    The input coordinates are expected in ``config.default_length_unit`` and
+    the returned ``"Fock"`` matrix is in Hartree.
+    """
+
+    def __init__(self, config: NetConfig):
+        super().__init__()
+        assert config.num_mat_conv <= config.action_blocks
+        self.begin_read_idx = config.action_blocks - config.num_mat_conv
+        self.pbc = False
+        self.cutoff = config.cutoff
+        self.max_edges = config.max_edges
+        self.full_edge_index = config.full_edge_index
+        self.embed = JitXEmbedding(
+            node_dim=config.node_dim,
+            edge_irreps=config.edge_irreps,
+            embed_basis=config.embed_basis,
+            aux_basis=config.aux_basis,
+            num_basis=config.num_basis,
+            rbf_kernel=config.rbf_kernel,
+            cutoff=config.cutoff,
+            cutoff_fn=config.cutoff_fn,
+        )
+        self.message = nn.ModuleList([
+            XPainnMessage(
+                node_dim=config.node_dim,
+                edge_irreps=config.edge_irreps,
+                num_basis=config.num_basis,
+                actfn=config.activation,
+                norm_type=config.norm_type,
+            )
+            for _ in range(config.action_blocks)
+        ])
+        self.update = nn.ModuleList([
+            XPainnUpdate(
+                node_dim=config.node_dim,
+                edge_irreps=config.edge_irreps,
+                actfn=config.activation,
+                norm_type=config.norm_type,
+            )
+            for _ in range(config.action_blocks)
+        ])
+        self.edge_full_embed = FullEdgeKernel(
+            rbf_kernel=config.pair_rbf_kernel,
+            num_basis=config.pair_num_basis,
+            cutoff=config.pair_cutoff,
+            cutoff_fn=config.cutoff_fn,
+        )
+        self.mat_transform = nn.ModuleList([
+            JitXMatTrans(
+                irreps_node=config.edge_irreps,
+                hidden_dim=config.mat_hidden_dim,
+                max_l=config.max_l,
+                edge_dim=config.pair_num_basis,
+                actfn=config.activation,
+                rbf_bias=True,
+            )
+            for _ in range(config.num_mat_conv)
+        ])
+        self.output = JitMatriceOut(
+            irreps_out=config.irreps_out,
+            node_dim=config.node_dim,
+            hidden_dim=config.mat_hidden_dim,
+            block_dim=config.mat_block_dim,
+            max_l=config.max_l,
+            actfn=config.activation,
+            symmetrize=config.symmetrize,
+        )
+        self.mask_generator = JitTwoBodyBlockMask(
+            irreps_out=config.irreps_out,
+            possible_elements=config.possible_elements,
+            basisname=config.target_basisname,
+        )
+        self.matrix_builder = JitBuildMatPerMole(
+            irreps_out=config.irreps_out,
+            possible_elements=config.possible_elements,
+            basisname=config.target_basisname,
+            map_type=config.m_idx_map_type,
+        )
+        self.prop_unit_conv = unit_conversion(config.default_property_unit, "Hartree")
+
+    def forward(
+        self,
+        at_no: torch.LongTensor,
+        pos: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        edge_index = radius_graph(pos, r=self.cutoff, max_num_neighbors=self.max_edges)
+        natms = at_no.shape[0]
+        if self.full_edge_index:
+            fc_edge_index = edge_index
+        else:
+            diag_mask = torch.eye(natms, dtype=torch.bool, device=pos.device)
+            fc_edge_index = torch.nonzero(torch.logical_not(diag_mask)).T.long()
+        shifts = torch.zeros((edge_index.shape[1], 3), device=pos.device, dtype=pos.dtype)
+        fc_shifts = torch.zeros((fc_edge_index.shape[1], 3), device=pos.device, dtype=pos.dtype)
+        node_mask, edge_mask = self.mask_generator(at_no, fc_edge_index)
+
+        x_scalar, rbf, fcut, rshs = self.embed(at_no, pos, edge_index, shifts)
+        x_spherical = torch.zeros(
+            (x_scalar.shape[0], rshs.shape[1]), device=x_scalar.device, dtype=x_scalar.dtype
+        )
+        full_rbfs = self.edge_full_embed(pos, fc_edge_index, fc_shifts)
+
+        node_sph_ten: Optional[torch.Tensor] = None
+        edge_sph_ten: Optional[torch.Tensor] = None
+        for idx, (msg, upd) in enumerate(zip(self.message, self.update)):
+            x_scalar, x_spherical = msg(x_scalar, x_spherical, rbf, fcut, rshs, edge_index)
+            x_scalar, x_spherical = upd(x_scalar, x_spherical)
+            if idx >= self.begin_read_idx:
+                for mt_idx, mt in enumerate(self.mat_transform):
+                    if mt_idx == idx - self.begin_read_idx:
+                        node_sph_ten, edge_sph_ten = mt(
+                            x_spherical, full_rbfs, fc_edge_index, node_sph_ten, edge_sph_ten
+                        )
+        if node_sph_ten is None or edge_sph_ten is None:
+            raise RuntimeError("No matrix transformation block was applied")
+        node_blocks, edge_blocks = self.output(
+            node_sph_ten, edge_sph_ten, x_scalar, fc_edge_index, fc_edge_index
+        )
+        fock = self.matrix_builder(
+            node_blocks, edge_blocks, node_mask, edge_mask, at_no, fc_edge_index
+        )
+        return {"Fock": fock * self.prop_unit_conv}
+
+
+class JitXPaiNN3Orb(nn.Module):
+    """
+    XPaiNN-Orb/X2 model for JIT script, assembling the full Hamiltonian matrix
+    for a single molecule. This model does not consider batch nor PBC.
+
+    ``ovlp`` is the overlap matrix in the atomic-orbital basis of
+    ``config.target_basisname`` (shape ``(nbasis, nbasis)``); the X2 pair
+    features (``fc_edge_attr``) are generated internally from it. The overlap
+    is folded in ``float64`` and then cast to the model dtype. The input
+    coordinates are expected in ``config.default_length_unit`` and the returned
+    ``"Fock"`` matrix is in Hartree.
+    """
+
+    def __init__(self, config: NetConfig):
+        super().__init__()
+        assert config.num_mat_conv <= config.action_blocks
+        self.begin_read_idx = config.action_blocks - config.num_mat_conv
+        self.pbc = False
+        self.cutoff = config.cutoff
+        self.max_edges = config.max_edges
+        self.full_edge_index = config.full_edge_index
+        self.embed = JitXEmbedding(
+            node_dim=config.node_dim,
+            edge_irreps=config.edge_irreps,
+            embed_basis=config.embed_basis,
+            aux_basis=config.aux_basis,
+            num_basis=config.num_basis,
+            rbf_kernel=config.rbf_kernel,
+            cutoff=config.cutoff,
+            cutoff_fn=config.cutoff_fn,
+        )
+        self.message = nn.ModuleList([
+            XPainnMessage(
+                node_dim=config.node_dim,
+                edge_irreps=config.edge_irreps,
+                num_basis=config.num_basis,
+                actfn=config.activation,
+                norm_type=config.norm_type,
+            )
+            for _ in range(config.action_blocks)
+        ])
+        self.update = nn.ModuleList([
+            XPainnUpdate(
+                node_dim=config.node_dim,
+                edge_irreps=config.edge_irreps,
+                actfn=config.activation,
+                norm_type=config.norm_type,
+            )
+            for _ in range(config.action_blocks)
+        ])
+        self.edge_full_embed = JitBlockNorm2d(irreps_out=config.irreps_out)
+        self.edge_full_rshs = FullEdgeSPH(irreps_node=config.edge_irreps)
+        self.edge_attr_generator = JitMat2GraphLabel(
+            target_irreps=config.irreps_out,
+            possible_elements=config.possible_elements,
+            basisname=config.target_basisname,
+            map_type=config.m_idx_map_type,
+        )
+        self.mat_transform = nn.ModuleList([
+            JitZMatTrans(
+                irreps_node=config.edge_irreps,
+                hidden_dim=config.mat_hidden_dim,
+                max_l=config.max_l,
+                edge_dim=config.pair_num_basis,
+                actfn=config.activation,
+                rbf_bias=False,
+            )
+            for _ in range(config.num_mat_conv)
+        ])
+        self.output = JitZMatriceOut(
+            irreps_out=config.irreps_out,
+            node_dim=config.node_dim,
+            edge_dim=config.pair_num_basis,
+            hidden_dim=config.mat_hidden_dim,
+            block_dim=config.mat_block_dim,
+            max_l=config.max_l,
+            actfn=config.activation,
+            symmetrize=config.symmetrize,
+        )
+        self.mask_generator = JitTwoBodyBlockMask(
+            irreps_out=config.irreps_out,
+            possible_elements=config.possible_elements,
+            basisname=config.target_basisname,
+        )
+        self.matrix_builder = JitBuildMatPerMole(
+            irreps_out=config.irreps_out,
+            possible_elements=config.possible_elements,
+            basisname=config.target_basisname,
+            map_type=config.m_idx_map_type,
+        )
+        self.prop_unit_conv = unit_conversion(config.default_property_unit, "Hartree")
+
+    def forward(
+        self,
+        at_no: torch.LongTensor,
+        pos: torch.Tensor,
+        ovlp: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        edge_index = radius_graph(pos, r=self.cutoff, max_num_neighbors=self.max_edges)
+        natms = at_no.shape[0]
+        if self.full_edge_index:
+            fc_edge_index = edge_index
+        else:
+            diag_mask = torch.eye(natms, dtype=torch.bool, device=pos.device)
+            fc_edge_index = torch.nonzero(torch.logical_not(diag_mask)).T.long()
+        shifts = torch.zeros((edge_index.shape[1], 3), device=pos.device, dtype=pos.dtype)
+        fc_shifts = torch.zeros((fc_edge_index.shape[1], 3), device=pos.device, dtype=pos.dtype)
+        node_mask, edge_mask = self.mask_generator(at_no, fc_edge_index)
+
+        x_scalar, rbfs, fcut, rshs = self.embed(at_no, pos, edge_index, shifts)
+        x_spherical = torch.zeros(
+            (x_scalar.shape[0], rshs.shape[1]), device=x_scalar.device, dtype=x_scalar.dtype
+        )
+        _, fc_edge_attr = self.edge_attr_generator(at_no, ovlp.to(torch.float64), fc_edge_index)
+        fc_edge_attr = fc_edge_attr.to(x_scalar.dtype)
+        full_rbfs = self.edge_full_embed(fc_edge_attr)
+        full_rshs = self.edge_full_rshs(pos, fc_edge_index, fc_shifts)
+
+        node_sph_ten: Optional[torch.Tensor] = None
+        edge_sph_ten: Optional[torch.Tensor] = None
+        for idx, (msg, upd) in enumerate(zip(self.message, self.update)):
+            x_scalar, x_spherical = msg(x_scalar, x_spherical, rbfs, fcut, rshs, edge_index)
+            x_scalar, x_spherical = upd(x_scalar, x_spherical)
+            if idx >= self.begin_read_idx:
+                for mt_idx, mt in enumerate(self.mat_transform):
+                    if mt_idx == idx - self.begin_read_idx:
+                        node_sph_ten, edge_sph_ten = mt(
+                            x_spherical, full_rbfs, full_rshs, fc_edge_index,
+                            node_sph_ten, edge_sph_ten,
+                        )
+        if node_sph_ten is None or edge_sph_ten is None:
+            raise RuntimeError("No matrix transformation block was applied")
+        node_blocks, edge_blocks = self.output(
+            node_sph_ten, edge_sph_ten, x_scalar, full_rbfs, fc_edge_index, fc_edge_index
+        )
+        fock = self.matrix_builder(
+            node_blocks, edge_blocks, node_mask, edge_mask, at_no, fc_edge_index
+        )
+        return {"Fock": fock * self.prop_unit_conv}
+
+
 def resolve_jit_model(config: NetConfig) -> nn.Module:
-    if config.version.lower() == "xpainn":
+    version = config.version.lower()
+    if version == "xpainn":
         return JitPaiNN(config)
-    elif config.version.lower() == "xpainn-ele":
+    elif version == "xpainn-ele":
         return JitPaiNNEle(config)
+    elif version == "xpainn-mat":
+        return JitXPaiNNOrb(config)
+    elif version == "xpainn3-mat":
+        return JitXPaiNN3Orb(config)
     else:
         raise NotImplementedError(f"Unsupported model {config.version}")
     
