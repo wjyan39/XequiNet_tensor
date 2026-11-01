@@ -100,7 +100,7 @@ class NetConfig(BaseModel):
     lr_sche_kwargs: dict = {}                      # kwargs for the learning rate scheduler
     early_stop: Optional[int] = None               # number of the epochs to wait before stopping the training
     ema_decay: Optional[float] = None              # exponential moving average decay
-    reg_weigtht: float = 1.0                       # weight of the regularization term for certain tasks
+    reg_weight: float = 1.0                        # weight of the regularization term for certain tasks
 
     # configurations about the logging
     save_dir: str = './'                           # directory to save the model
