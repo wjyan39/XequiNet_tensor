@@ -1297,6 +1297,7 @@ class WavefunctionTrainer(OrbitalTrainer):
         dist_sampler: Optional[DistributedSampler], 
         log: ZeroLogger,
     ):
+        assert config.ortho_transform == True, "WavefunctionTrainer requires set config.ortho_transform to True"
         super(WavefunctionTrainer, self).__init__(model, config, device, train_loader, valid_loader, dist_sampler, log)
     
     def _get_reg_term(self, data, real_fock, pred_fock):
